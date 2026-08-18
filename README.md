@@ -86,6 +86,7 @@ curl -H "Authorization: Bearer $AUTOMODE_ADMIN_TOKEN" http://127.0.0.1:8787/heal
 ```
 
 - 控制台与 API：`http://<服务器>:8787/`；管理 API 需要 `Authorization: Bearer <AUTOMODE_ADMIN_TOKEN>`。
+- 启用 `AUTOMODE_ADMIN_TOKEN` 后，控制台首次打开会显示“管理端认证”界面，输入 Token 后保存在浏览器本地存储，用于访问本网关的管理 API。
 - 上游模型服务：外部地址直接填；宿主机上的服务填 `http://host.docker.internal:PORT`（compose 已配置 `extra_hosts`）；同一 Docker 网络内的容器填服务名，如 `http://litellm:4000`。
 - SQLite 数据持久化在命名卷 `automode-data`（容器内 `/app/data/automode.db`）；升级镜像后数据保留。
 - 控制台静态目录默认按源码位置解析；wheel 安装（如 Docker 镜像）时通过 `AUTOMODE_WEB_DIST` 指向 `web/dist`（镜像已内置，无需手动配置）。
@@ -169,7 +170,7 @@ npm --prefix web run build
 npm --prefix web audit
 ```
 
-当前基线：后端 76 个测试、前端 3 个测试全部通过；核心判定与规则模块分支覆盖率 ≥ 90%。
+当前基线：后端 76 个测试、前端 4 个测试全部通过；核心判定与规则模块分支覆盖率 ≥ 90%。
 
 ## 文档
 

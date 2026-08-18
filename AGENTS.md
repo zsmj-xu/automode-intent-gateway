@@ -30,4 +30,4 @@
 
 - Anthropic Messages、OpenAI Chat Completions、OpenAI Responses、JSON/SSE 和规则控制台均已实现。
 - 自然语言规则采用受限结构化编译，支持预览、测试、确认、启停、版本和回滚。
-- 当前验证基线为后端 76 个测试、前端 3 个测试和生产构建通过；Enforce/Action Gateway、SSO/RBAC 和多机部署仍未实现。
+- 当前验证基线为后端 76 个测试、前端 4 个测试和生产构建通过；Enforce/Action Gateway、SSO/RBAC 和多机部署仍未实现。

@@ -4,7 +4,7 @@ import {
   CircleHelp, Gauge, History, Menu, RefreshCw, RotateCcw, Save, Settings,
   ShieldAlert, ShieldCheck, SlidersHorizontal, X,
 } from 'lucide-react'
-import { api, formatTime, patch, post } from './api'
+import { api, formatTime, getAdminToken, onUnauthorized, patch, post, setAdminToken } from './api'
 
 type Page = 'dashboard' | 'sessions' | 'alerts' | 'rules' | 'playground' | 'settings'
 type Json = Record<string, any>
@@ -31,14 +31,19 @@ export function App() {
   const [menuOpen, setMenuOpen] = useState(false)
   const [refresh, setRefresh] = useState(0)
   const [connected, setConnected] = useState(false)
+  const [token, setToken] = useState(getAdminToken)
+  const [authNeeded, setAuthNeeded] = useState(false)
   useEffect(() => {
-    const stream = new EventSource('/api/events')
-    stream.onopen = () => setConnected(true)
-    stream.onerror = () => setConnected(false)
-    ;['trace.created', 'trace.completed', 'classification.completed', 'alert.created', 'alert.updated', 'rule.updated']
-      .forEach(name => stream.addEventListener(name, () => setRefresh(value => value + 1)))
-    return () => stream.close()
+    const handler = () => setAuthNeeded(true)
+    onUnauthorized(handler)
+    return () => onUnauthorized(null)
   }, [])
+  useEventStream(token, (name, live) => {
+    setConnected(live)
+    if (name && ['trace.created', 'trace.completed', 'classification.completed', 'alert.created', 'alert.updated', 'rule.updated'].includes(name)) {
+      setRefresh(value => value + 1)
+    }
+  })
   useEffect(() => {
     const closeOnEscape = (event: KeyboardEvent) => { if (event.key === 'Escape') setMenuOpen(false) }
     window.addEventListener('keydown', closeOnEscape)
@@ -56,16 +61,80 @@ export function App() {
     {menuOpen && <button className="backdrop" aria-label="关闭导航" onClick={() => setMenuOpen(false)}/>} 
     <main>
       <header><button className="icon-button mobile-menu" aria-label="打开导航" onClick={() => setMenuOpen(true)}><Menu/></button><div><p className="eyebrow">INTENT SECURITY CONSOLE</p><h1>{title}</h1></div><button className="secondary compact" onClick={() => setRefresh(value => value + 1)}><RefreshCw size={16}/>刷新</button></header>
-      <div className="content">
-        {page === 'dashboard' && <Dashboard refresh={refresh}/>} 
-        {page === 'sessions' && <Sessions refresh={refresh}/>} 
-        {page === 'alerts' && <Alerts refresh={refresh}/>} 
-        {page === 'rules' && <Rules refresh={refresh}/>} 
-        {page === 'playground' && <Playground/>} 
-        {page === 'settings' && <SettingsPage/>} 
-      </div>
+      {authNeeded
+        ? <AuthGate token={token} onSave={value => { setAdminToken(value); setToken(value); setAuthNeeded(false); setRefresh(r => r + 1) }} onClear={() => { setAdminToken(''); setToken(''); setAuthNeeded(false); setRefresh(r => r + 1) }}/>
+        : <div className="content">
+          {page === 'dashboard' && <Dashboard refresh={refresh}/>} 
+          {page === 'sessions' && <Sessions refresh={refresh}/>} 
+          {page === 'alerts' && <Alerts refresh={refresh}/>} 
+          {page === 'rules' && <Rules refresh={refresh}/>} 
+          {page === 'playground' && <Playground/>} 
+          {page === 'settings' && <SettingsPage/>} 
+        </div>}
     </main>
   </div>
+}
+
+function AuthGate({ token, onSave, onClear }: { token: string; onSave: (value: string) => void; onClear: () => void }) {
+  const [draft, setDraft] = useState(token)
+  return <div className="content auth-wrap">
+    <section className="panel auth-card" role="dialog" aria-label="管理端认证">
+      <div className="panel-title"><div><h2>管理端认证</h2><p>网关启用了 <code>AUTOMODE_ADMIN_TOKEN</code>，访问控制台需要管理 Token。</p></div></div>
+      <label>管理 Token<input type="password" aria-label="管理 Token" autoComplete="new-password" value={draft} onChange={event => setDraft(event.target.value)} placeholder="粘贴 AUTOMODE_ADMIN_TOKEN 的值"/></label>
+      <div className="auth-actions">
+        <button className="primary" disabled={!draft.trim()} onClick={() => onSave(draft.trim())}><ShieldCheck size={17}/>保存并连接</button>
+        {token && <button className="secondary" onClick={onClear}>清除 Token</button>}
+      </div>
+      <p className="auth-hint">Token 只保存在当前浏览器的本地存储中，仅用于访问本网关的管理 API。</p>
+    </section>
+  </div>
+}
+
+function useEventStream(token: string, onEvent: (name: string, live: boolean) => void) {
+  useEffect(() => {
+    let cancelled = false
+    let timer: number | undefined
+    let live = false
+    const setLive = (value: boolean) => { if (live !== value) { live = value; onEvent('', value) } }
+    const scheduleRetry = () => { if (!cancelled) timer = window.setTimeout(connect, 3000) }
+    async function connect() {
+      setLive(false)
+      try {
+        const response = await fetch('/api/events', { headers: token ? { 'x-automode-admin-token': token } : {} })
+        if (!response.ok || !response.body) { scheduleRetry(); return }
+        setLive(true)
+        const reader = response.body.getReader()
+        const decoder = new TextDecoder()
+        let buffer = ''
+        try {
+          for (;;) {
+            const { done, value } = await reader.read()
+            if (done) break
+            buffer += decoder.decode(value, { stream: true })
+            let sep = buffer.indexOf('\n\n')
+            while (sep !== -1) {
+              const block = buffer.slice(0, sep)
+              buffer = buffer.slice(sep + 2)
+              const name = sseEventName(block)
+              if (name) onEvent(name, true)
+              sep = buffer.indexOf('\n\n')
+            }
+          }
+        } finally { reader.releaseLock() }
+      } catch { /* connection dropped: retry below */ }
+      scheduleRetry()
+    }
+    connect()
+    return () => { cancelled = true; if (timer !== undefined) clearTimeout(timer) }
+  }, [token])
+}
+
+function sseEventName(block: string): string {
+  let name = ''
+  for (const line of block.split('\n')) {
+    if (line.startsWith('event:')) name = line.slice(6).trim()
+  }
+  return name
 }
 
 function useLoad<T>(path: string, refresh = 0) {
