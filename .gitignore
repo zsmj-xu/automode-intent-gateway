@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+/dist/
+web/node_modules/
+.DS_Store
+*.db
+*.db-shm
+*.db-wal
+.coverage
+web/dist/
+*.db.pre-*
+*.bak
+.env

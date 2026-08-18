@@ -1,0 +1,22 @@
+{
+  "litellm_call_id": "call-demo-001",
+  "kwargs": {
+    "model": "claude-sonnet",
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are a coding assistant."
+      },
+      {
+        "role": "user",
+        "content": "帮我分析 payment-api 在 staging 的部署失败日志，不要修改或重新部署。"
+      }
+    ],
+    "litellm_params": {
+      "metadata": {
+        "tenant": "demo"
+      }
+    }
+  }
+}
+

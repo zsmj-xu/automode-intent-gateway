@@ -1,0 +1,49 @@
+services:
+  automode:
+    build: .
+    image: automode-intent-gateway:latest
+    container_name: automode-intent-gateway
+    restart: unless-stopped
+    ports:
+      - "${AUTOMODE_PORT:-8787}:8787"
+    environment:
+      # 必填：上游模型服务地址（外部地址，或 host.docker.internal 指向宿主机）
+      AUTOMODE_UPSTREAM_BASE_URL: ${AUTOMODE_UPSTREAM_BASE_URL:?set AUTOMODE_UPSTREAM_BASE_URL in .env}
+      # 必填：非 loopback 监听要求的管理端 Token（/api/* 的 Bearer 认证）
+      AUTOMODE_ADMIN_TOKEN: ${AUTOMODE_ADMIN_TOKEN:?set AUTOMODE_ADMIN_TOKEN in .env}
+      # 可选：上游统一 Bearer Key（不填则透传 Agent 的 Authorization）
+      AUTOMODE_UPSTREAM_API_KEY: ${AUTOMODE_UPSTREAM_API_KEY:-}
+      # 可选：Fast（无思考）分类器
+      AUTOMODE_FAST_URL: ${AUTOMODE_FAST_URL:-}
+      AUTOMODE_FAST_MODEL: ${AUTOMODE_FAST_MODEL:-}
+      AUTOMODE_FAST_API_KEY: ${AUTOMODE_FAST_API_KEY:-}
+      AUTOMODE_FAST_TIMEOUT: ${AUTOMODE_FAST_TIMEOUT:-10}
+      AUTOMODE_FAST_MAX_TOKENS: ${AUTOMODE_FAST_MAX_TOKENS:-2400}
+      # 可选：Deep（带思考）分类器
+      AUTOMODE_DEEP_URL: ${AUTOMODE_DEEP_URL:-}
+      AUTOMODE_DEEP_MODEL: ${AUTOMODE_DEEP_MODEL:-}
+      AUTOMODE_DEEP_API_KEY: ${AUTOMODE_DEEP_API_KEY:-}
+      AUTOMODE_DEEP_TIMEOUT: ${AUTOMODE_DEEP_TIMEOUT:-10}
+      AUTOMODE_DEEP_MAX_TOKENS: ${AUTOMODE_DEEP_MAX_TOKENS:-2400}
+      # 可选：响应捕获上限（字节）与落库合并间隔（毫秒）
+      AUTOMODE_RESPONSE_CAPTURE_BYTES: ${AUTOMODE_RESPONSE_CAPTURE_BYTES:-8388608}
+      AUTOMODE_DB_FLUSH_INTERVAL_MS: ${AUTOMODE_DB_FLUSH_INTERVAL_MS:-25}
+    # Linux 上允许用 http://host.docker.internal:PORT 访问宿主机服务
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - automode-data:/app/data
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/health', timeout=3)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  automode-data:
