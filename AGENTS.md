@@ -30,4 +30,5 @@
 
 - Anthropic Messages、OpenAI Chat Completions、OpenAI Responses、JSON/SSE 和规则控制台均已实现。
 - 自然语言规则采用受限结构化编译，支持预览、测试、确认、启停、版本和回滚。
-- 当前验证基线为后端 76 个测试、前端 4 个测试和生产构建通过；Enforce/Action Gateway、SSO/RBAC 和多机部署仍未实现。
+- 会话按优先级归组：显式 session id（header/metadata/`previous_response_id`）→ 会话内容指纹（`session_fingerprint.py`，校验前缀续接）→ trace 级 fallback；会话累积授权基线（capabilities/forbidden/statements）随请求沉淀，审查按会话而非单请求判定。
+- 当前验证基线为后端 95 个测试、前端 4 个测试和生产构建通过；Enforce/Action Gateway、SSO/RBAC 和多机部署仍未实现。

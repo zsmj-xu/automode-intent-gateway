@@ -26,6 +26,8 @@ def register_admin_routes(app: web.Application, store: TraceStore) -> None:
     routes.add_get("/api/sessions", sessions)
     routes.add_get("/api/sessions/{session_id}", session)
     routes.add_get("/api/sessions/{session_id}/timeline", timeline)
+    routes.add_get("/api/sessions/{session_id}/detail", session_detail)
+    routes.add_post("/api/sessions/backfill", backfill_sessions)
     routes.add_get("/api/traces/{trace_id}/classification", classification)
     routes.add_get("/api/events", events)
     routes.add_get("/api/alerts", alerts)
@@ -69,6 +71,21 @@ async def session(request: web.Request) -> web.Response:
 
 async def timeline(request: web.Request) -> web.Response:
     return web.json_response({"data": await _store_call(request, "timeline", request.match_info["session_id"])})
+
+
+async def session_detail(request: web.Request) -> web.Response:
+    value = await _store_call(request, "session_detail", request.match_info["session_id"])
+    if value is None:
+        raise web.HTTPNotFound(text="session not found")
+    return web.json_response(value)
+
+
+async def backfill_sessions(request: web.Request) -> web.Response:
+    """Regroup historical traces into conversation sessions and rebuild the
+    session-level read model. Non-destructive to per-trace classification records."""
+    stats = await _store_call(request, "backfill_sessions")
+    request.app[EVENT_BROKER_KEY].publish("sessions.backfilled", {"stats": stats})
+    return web.json_response(stats)
 
 
 async def classification(request: web.Request) -> web.Response:

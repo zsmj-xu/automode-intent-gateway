@@ -71,12 +71,17 @@ def _first(payload: dict[str, Any], paths: Iterable[tuple[str, ...]], expected: 
     return expected()
 
 
+def extract_messages(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extract the conversation message list from a request payload, wherever it lives."""
+    messages = _first(payload, MESSAGE_PATHS, list)
+    return [message for message in messages if isinstance(message, dict)]
+
+
 def normalize(payload: dict[str, Any], source_format_override: str | None = None) -> NormalizedRequest:
     if not isinstance(payload, dict):
         raise ValueError("request log must be a JSON object")
 
-    messages = _first(payload, MESSAGE_PATHS, list)
-    messages = [message for message in messages if isinstance(message, dict)]
+    messages = extract_messages(payload)
     if not messages:
         raise ValueError(
             "no messages found; supported locations include messages, request.messages, "

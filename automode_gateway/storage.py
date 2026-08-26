@@ -12,6 +12,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .classifier import authorization_signals
+from .normalizer import extract_messages, normalize
+from .review_context import build_review_context
+from .session_fingerprint import conversation_fingerprint as fingerprint_messages
+from .session_fingerprint import messages_are_continuation
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -26,7 +32,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     tool_call_count INTEGER NOT NULL DEFAULT 0,
     allow_count INTEGER NOT NULL DEFAULT 0,
     alert_count INTEGER NOT NULL DEFAULT 0,
-    max_risk TEXT NOT NULL DEFAULT 'low'
+    max_risk TEXT NOT NULL DEFAULT 'low',
+    conversation_fingerprint TEXT,
+    authorization_json TEXT NOT NULL DEFAULT '{}'
 );
 CREATE TABLE IF NOT EXISTS traces (
     id TEXT PRIMARY KEY,
@@ -116,12 +124,23 @@ TRACE_COLUMNS = {
     "final_stage": "TEXT",
     "final_reason_code": "TEXT",
     "final_reason": "TEXT",
+    "session_evidence_json": "TEXT NOT NULL DEFAULT '{}'",
+    "response_body_json": "TEXT",
+    "response_content_type": "TEXT",
+    "response_capture_complete": "INTEGER NOT NULL DEFAULT 1",
 }
 
 STAGE_COLUMNS = {
     "matched_rule_versions_json": "TEXT NOT NULL DEFAULT '[]'",
     "evidence_json": "TEXT NOT NULL DEFAULT '[]'",
 }
+
+SESSION_COLUMNS = {
+    "conversation_fingerprint": "TEXT",
+    "authorization_json": "TEXT NOT NULL DEFAULT '{}'",
+}
+
+_RISK_ORDER = ["low", "medium", "high", "critical"]
 
 SECRET_HEADERS = {
     "authorization",
@@ -162,13 +181,19 @@ class TraceStore:
                 tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 trace_columns = {row[1] for row in connection.execute("PRAGMA table_info(traces)")} if "traces" in tables else set()
                 stage_columns = {row[1] for row in connection.execute("PRAGMA table_info(classification_stages)")} if "classification_stages" in tables else set()
-            if (trace_columns and set(TRACE_COLUMNS) - trace_columns) or (stage_columns and set(STAGE_COLUMNS) - stage_columns):
+                session_columns = {row[1] for row in connection.execute("PRAGMA table_info(sessions)")} if "sessions" in tables else set()
+            needs_migration = (
+                (trace_columns and set(TRACE_COLUMNS) - trace_columns)
+                or (stage_columns and set(STAGE_COLUMNS) - stage_columns)
+                or (session_columns and set(SESSION_COLUMNS) - session_columns)
+            )
+            if needs_migration:
                 backup = database.with_name(f"{database.name}.pre-automode-migration.bak")
                 shutil.copy2(database, backup)
         try:
             with self._connect() as connection:
                 connection.executescript(SCHEMA)
-                for table, columns in (("traces", TRACE_COLUMNS), ("classification_stages", STAGE_COLUMNS)):
+                for table, columns in (("traces", TRACE_COLUMNS), ("classification_stages", STAGE_COLUMNS), ("sessions", SESSION_COLUMNS)):
                     existing = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
                     for name, definition in columns.items():
                         if name not in existing:
@@ -191,6 +216,9 @@ class TraceStore:
         session_id: str | None,
         latest_user_text: str,
         declared_tool_count: int,
+        session_evidence: dict[str, Any] | None = None,
+        conversation_fingerprint: str | None = None,
+        session_signals: dict[str, Any] | None = None,
     ) -> str:
         trace_id = trace_id or str(uuid.uuid4())
         created_at = _now()
@@ -198,22 +226,32 @@ class TraceStore:
             key: ("[REDACTED]" if key.lower() in SECRET_HEADERS else value)
             for key, value in headers.items()
         }
+        payload_messages = extract_messages(payload)
+        fingerprint = conversation_fingerprint or fingerprint_messages(payload_messages)
         with self._connect() as connection:
             session_record_id = _upsert_session(
                 connection,
                 external_session_id=session_id,
+                conversation_fingerprint=fingerprint,
+                incoming_messages=payload_messages,
                 fallback_id=f"trace:{trace_id}",
                 created_at=created_at,
                 protocol=protocol,
                 model=payload.get("model"),
                 client_type=_client_type(headers),
             )
+            if session_signals:
+                merged = _merge_authorization(connection, session_record_id, session_signals)
+                connection.execute(
+                    "UPDATE sessions SET authorization_json=? WHERE id=?",
+                    (json.dumps(merged, ensure_ascii=False), session_record_id),
+                )
             connection.execute(
                 """INSERT INTO traces (
                     id, created_at, protocol, method, path, model, session_id, is_stream,
                     latest_user_text, declared_tool_count, request_headers_json, request_body_json,
-                    session_record_id, pipeline_status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')""",
+                    session_record_id, pipeline_status, session_evidence_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)""",
                 (
                     trace_id,
                     created_at,
@@ -228,6 +266,7 @@ class TraceStore:
                     json.dumps(safe_headers, ensure_ascii=False),
                     json.dumps(_sanitize_payload(payload), ensure_ascii=False) if self.store_raw else None,
                     session_record_id,
+                    json.dumps(session_evidence or {"status": "missing", "selected": None, "candidates": []}, ensure_ascii=False),
                 ),
             )
         return trace_id
@@ -344,12 +383,17 @@ class TraceStore:
         response_bytes: int,
         latency_ms: float,
         error: str | None = None,
+        response_body: bytes | None = None,
+        response_content_type: str = "",
+        response_capture_complete: bool = True,
     ) -> None:
+        recorded_response = _record_response_body(response_body, response_content_type, response_capture_complete) if self.store_raw else None
         with self._connect() as connection:
             connection.execute(
-                """UPDATE traces SET response_status=?, response_bytes=?, latency_ms=?, error=?
+                """UPDATE traces SET response_status=?, response_bytes=?, latency_ms=?, error=?,
+                   response_body_json=?, response_content_type=?, response_capture_complete=?
                    WHERE id=?""",
-                (status, response_bytes, latency_ms, error, trace_id),
+                (status, response_bytes, latency_ms, error, json.dumps(recorded_response, ensure_ascii=False) if recorded_response is not None else None, response_content_type, int(response_capture_complete), trace_id),
             )
 
     def enabled_rules(self) -> list[dict[str, Any]]:
@@ -463,7 +507,7 @@ class TraceStore:
     ) -> list[dict[str, Any]]:
         with self._connect() as connection:
             rows = connection.execute("SELECT * FROM sessions ORDER BY last_seen_at DESC LIMIT 500").fetchall()
-            result = [_json_row(row, ("protocols_json", "models_json")) for row in rows]
+            result = [_json_row(row, ("protocols_json", "models_json", "authorization_json")) for row in rows]
             if capability:
                 allowed_ids = {row[0] for row in connection.execute(
                     """SELECT DISTINCT t.session_record_id FROM traces t JOIN tool_actions a ON a.trace_id=t.id
@@ -487,15 +531,148 @@ class TraceStore:
     def session(self, session_id: str) -> dict[str, Any] | None:
         with self._connect() as connection:
             row = connection.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
-        return _json_row(row, ("protocols_json", "models_json")) if row else None
+        return _json_row(row, ("protocols_json", "models_json", "authorization_json")) if row else None
+
+    def session_baseline_for_trace(self, trace_id: str) -> dict[str, Any] | None:
+        """The session-wide authorization baseline accumulated for a trace's session."""
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT s.authorization_json FROM sessions s
+                   JOIN traces t ON t.session_record_id=s.id WHERE t.id=?""",
+                (trace_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        value = json.loads(row[0] or "{}")
+        return value if isinstance(value, dict) and value else None
+
+    def backfill_sessions(self) -> dict[str, Any]:
+        """Regroup historical traces into conversation sessions and rebuild the
+        session-level read model (aggregates + authorization baselines).
+
+        Uses the same resolution priority as the live path: explicit session id,
+        then conversation fingerprint with prefix verification, then trace fallback.
+        Per-trace classification records are preserved untouched; orphaned
+        trace-fallback sessions created before session grouping existed are removed.
+        Safe to re-run: resolution and aggregation are deterministic.
+        """
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT id, created_at, protocol, model, session_id, session_record_id,
+                          request_body_json
+                   FROM traces ORDER BY created_at"""
+            ).fetchall()
+        sessions_before = len({row["session_record_id"] for row in rows})
+        regrouped = 0
+        with self._connect() as connection:
+            for row in rows:
+                payload = json.loads(row["request_body_json"]) if row["request_body_json"] else None
+                messages = extract_messages(payload) if isinstance(payload, dict) else []
+                fingerprint = fingerprint_messages(messages)
+                resolved = _upsert_session(
+                    connection,
+                    external_session_id=row["session_id"],
+                    conversation_fingerprint=fingerprint,
+                    incoming_messages=messages,
+                    fallback_id=f"trace:{row['id']}",
+                    created_at=row["created_at"],
+                    protocol=row["protocol"],
+                    model=row["model"],
+                    client_type="unknown",
+                )
+                if resolved != row["session_record_id"]:
+                    regrouped += 1
+                    connection.execute(
+                        "UPDATE traces SET session_record_id=? WHERE id=?", (resolved, row["id"])
+                    )
+        baselines: dict[str, dict[str, Any]] = {}
+        with self._connect() as connection:
+            grouped = connection.execute(
+                "SELECT session_record_id, request_body_json FROM traces ORDER BY created_at"
+            ).fetchall()
+        for row in grouped:
+            payload = json.loads(row["request_body_json"]) if row["request_body_json"] else None
+            if not isinstance(payload, dict):
+                continue
+            try:
+                normalized = normalize(payload, source_format_override=None)
+            except (ValueError, TypeError):
+                continue
+            user_messages = build_review_context(normalized).user_messages
+            if not user_messages:
+                continue
+            current = baselines.get(row["session_record_id"]) or {"capabilities": [], "forbidden_capabilities": [], "statements": []}
+            baselines[row["session_record_id"]] = _merge_authorization_values(current, authorization_signals(user_messages))
+        with self._connect() as connection:
+            for session_id, baseline in baselines.items():
+                connection.execute(
+                    "UPDATE sessions SET authorization_json=? WHERE id=?",
+                    (json.dumps(baseline, ensure_ascii=False), session_id),
+                )
+            orphan_sessions_deleted = connection.execute(
+                "DELETE FROM sessions WHERE id NOT IN (SELECT DISTINCT session_record_id FROM traces)"
+            ).rowcount
+            self._rebuild_session_aggregates(connection)
+        return {
+            "traces": len(rows),
+            "sessions_before": sessions_before,
+            "sessions_after": self._count_sessions_with_traces(),
+            "regrouped_traces": regrouped,
+            "baselines_written": len(baselines),
+            "orphan_sessions_deleted": orphan_sessions_deleted,
+        }
+
+    def _rebuild_session_aggregates(self, connection: sqlite3.Connection) -> None:
+        """Recompute every session's counters from its traces (after regrouping)."""
+        rows = connection.execute(
+            "SELECT session_record_id FROM traces GROUP BY session_record_id"
+        ).fetchall()
+        for row in rows:
+            session_id = row[0]
+            traces = connection.execute(
+                "SELECT * FROM traces WHERE session_record_id=? ORDER BY created_at", (session_id,)
+            ).fetchall()
+            if not traces:
+                continue
+            trace_ids = [trace["id"] for trace in traces]
+            protocols = list(dict.fromkeys(trace["protocol"] for trace in traces))
+            models = list(dict.fromkeys(trace["model"] for trace in traces if trace["model"]))
+            tool_call_count = 0
+            if trace_ids:
+                placeholders = ", ".join("?" for _ in trace_ids)
+                tool_call_count = connection.execute(
+                    f"SELECT COUNT(*) FROM tool_actions WHERE trace_id IN ({placeholders})", trace_ids
+                ).fetchone()[0]
+            allow_count = sum(1 for trace in traces if (trace["final_decision"] or trace["decision"]) == "allow")
+            alert_count = sum(1 for trace in traces if (trace["final_decision"] or trace["decision"]) == "alert")
+            max_risk = "low"
+            for trace in traces:
+                risk = trace["risk"]
+                if risk in _RISK_ORDER and _RISK_ORDER.index(risk) > _RISK_ORDER.index(max_risk):
+                    max_risk = risk
+            connection.execute(
+                """UPDATE sessions SET created_at=?, last_seen_at=?, protocols_json=?, models_json=?,
+                   call_count=?, tool_call_count=?, allow_count=?, alert_count=?, max_risk=? WHERE id=?""",
+                (
+                    traces[0]["created_at"], traces[-1]["created_at"],
+                    json.dumps(protocols), json.dumps(models),
+                    len(traces), tool_call_count, allow_count, alert_count, max_risk, session_id,
+                ),
+            )
+
+    def _count_sessions_with_traces(self) -> int:
+        with self._connect() as connection:
+            return connection.execute(
+                "SELECT COUNT(*) FROM sessions WHERE id IN (SELECT DISTINCT session_record_id FROM traces)"
+            ).fetchone()[0]
 
     def timeline(self, session_id: str) -> list[dict[str, Any]]:
         with self._connect() as connection:
             traces = connection.execute("SELECT * FROM traces WHERE session_record_id=? ORDER BY created_at", (session_id,)).fetchall()
             result: list[dict[str, Any]] = []
             for trace in traces:
-                result.append({"type": "user_message", "at": trace["created_at"], "trace_id": trace["id"], "text": trace["latest_user_text"]})
-                result.append({"type": "model_call", "at": trace["created_at"], "trace_id": trace["id"], "model": trace["model"], "protocol": trace["protocol"]})
+                result.append({"type": "user_message", "at": trace["created_at"], "trace_id": trace["id"], "text": trace["latest_user_text"], "session_evidence": json.loads(trace["session_evidence_json"] or "{}")})
+                result.append({"type": "model_call", "at": trace["created_at"], "trace_id": trace["id"], "model": trace["model"], "protocol": trace["protocol"], "request_body": json.loads(trace["request_body_json"] or "null"), "response_body": json.loads(trace["response_body_json"] or "null"), "response_content_type": trace["response_content_type"], "response_capture_complete": bool(trace["response_capture_complete"])})
                 actions = connection.execute("SELECT * FROM tool_actions WHERE trace_id=? ORDER BY created_at", (trace["id"],)).fetchall()
                 result.extend({"type": "tool_action", "at": row["created_at"], "trace_id": trace["id"], "tool_name": row["tool_name"], "capability": row["capability"], "target": row["target"]} for row in actions)
                 run = connection.execute("SELECT * FROM classification_runs WHERE trace_id=? ORDER BY completed_at DESC LIMIT 1", (trace["id"],)).fetchone()
@@ -504,6 +681,60 @@ class TraceStore:
                     result.extend({"type": "classification_stage", "at": run["completed_at"], "trace_id": trace["id"], "stage": row["stage"], "status": row["status"], "verdict": row["verdict"], "reason_code": row["reason_code"], "reason": row["reason"], "model": row["model"], "latency_ms": row["latency_ms"], "risk": row["risk"], "matched_rules": json.loads(row["matched_rule_versions_json"] or "[]"), "evidence": json.loads(row["evidence_json"] or "[]")} for row in stages)
                     result.append({"type": "final_decision", "at": run["completed_at"], "trace_id": trace["id"], "decision": run["final_decision"], "stage": run["final_stage"]})
         return result
+
+    def session_detail(self, session_id: str) -> dict[str, Any] | None:
+        """Return a session plus every trace's full audit payload in one call.
+
+        This is the read-model for the console's audit timeline: session
+        metadata, per-trace raw request/response, proposed tool actions, the
+        complete classification report (review transcript, stages, alignment),
+        and any alerts raised for that trace.
+        """
+        session = self.session(session_id)
+        if session is None:
+            return None
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM traces WHERE session_record_id=? ORDER BY created_at", (session_id,)
+            ).fetchall()
+        trace_ids = [row["id"] for row in rows]
+        actions_by_trace: dict[str, list[dict[str, Any]]] = {tid: [] for tid in trace_ids}
+        alerts_by_trace: dict[str, list[dict[str, Any]]] = {tid: [] for tid in trace_ids}
+        if trace_ids:
+            placeholders = ", ".join("?" for _ in trace_ids)
+            with self._connect() as connection:
+                for action in connection.execute(
+                    f"SELECT * FROM tool_actions WHERE trace_id IN ({placeholders}) ORDER BY created_at",
+                    trace_ids,
+                ).fetchall():
+                    actions_by_trace[action["trace_id"]].append(_tool_action_row(action))
+                for alert in connection.execute(
+                    f"SELECT * FROM alerts WHERE trace_id IN ({placeholders}) ORDER BY created_at",
+                    trace_ids,
+                ).fetchall():
+                    alerts_by_trace[alert["trace_id"]].append(_alert_row(alert))
+        traces: list[dict[str, Any]] = []
+        for row in rows:
+            trace_id = row["id"]
+            traces.append({
+                "trace_id": trace_id,
+                "created_at": row["created_at"],
+                "model": row["model"],
+                "protocol": row["protocol"],
+                "method": row["method"],
+                "path": row["path"],
+                "latest_user_text": row["latest_user_text"],
+                "response_status": row["response_status"],
+                "latency_ms": row["latency_ms"],
+                "response_capture_complete": bool(row["response_capture_complete"]),
+                "session_evidence": json.loads(row["session_evidence_json"] or "{}"),
+                "request_body": json.loads(row["request_body_json"]) if row["request_body_json"] else None,
+                "response_body": json.loads(row["response_body_json"]) if row["response_body_json"] else None,
+                "tool_actions": actions_by_trace.get(trace_id, []),
+                "classification": self.classification(trace_id),
+                "alerts": alerts_by_trace.get(trace_id, []),
+            })
+        return {"session": session, "traces": traces}
 
     def classification(self, trace_id: str) -> dict[str, Any] | None:
         with self._connect() as connection:
@@ -650,15 +881,28 @@ class TraceStore:
 
 def _public_row(row: sqlite3.Row, include_raw: bool = False) -> dict[str, Any]:
     result = dict(row)
-    for field in ("request_headers_json", "classification_json"):
+    for field in ("request_headers_json", "classification_json", "session_evidence_json"):
         result[field.removesuffix("_json")] = json.loads(result.pop(field) or "null")
     if result["classification"] is None:
         result["classification"] = {"decision": "pending", "proposed_tool_calls": []}
     raw = result.pop("request_body_json")
+    response_raw = result.pop("response_body_json", None)
     if include_raw:
         result["request_body"] = json.loads(raw) if raw else None
+        result["response_body"] = json.loads(response_raw) if response_raw else None
     result["is_stream"] = bool(result["is_stream"])
     return result
+
+
+def _record_response_body(body: bytes | None, content_type: str, complete: bool) -> Any:
+    if body is None:
+        return None
+    text = body.decode("utf-8", "replace")
+    try:
+        value: Any = json.loads(text)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        value = {"raw": text, "stream": "text/event-stream" in content_type.lower()}
+    return {"content_type": content_type, "capture_complete": bool(complete), "data": _sanitize_payload(value)}
 
 
 RULE_FIELDS = {
@@ -711,31 +955,171 @@ def _upsert_session(
     connection: sqlite3.Connection,
     *,
     external_session_id: str | None,
+    conversation_fingerprint: str | None,
+    incoming_messages: list[dict[str, Any]],
     fallback_id: str,
     created_at: str,
     protocol: str,
     model: str | None,
     client_type: str,
 ) -> str:
-    external = external_session_id or fallback_id
-    row = connection.execute("SELECT * FROM sessions WHERE external_session_id=?", (external,)).fetchone()
-    if row:
-        protocols = list(dict.fromkeys([*json.loads(row["protocols_json"]), protocol]))
-        models = list(dict.fromkeys([*json.loads(row["models_json"]), *([model] if model else [])]))
-        connection.execute(
-            "UPDATE sessions SET last_seen_at=?, protocols_json=?, models_json=?, call_count=call_count+1 WHERE id=?",
-            (created_at, json.dumps(protocols), json.dumps(models), row["id"]),
+    """Resolve the session a trace belongs to, by priority:
+
+    1. explicit session id (header / metadata / conversation chain) — authoritative;
+    2. conversation fingerprint — a content-derived identity matched against recent
+       sessions of the same opener, reused only when the incoming messages are a
+       verified continuation of the session's last trace;
+    3. trace fallback — one session per request when nothing else is available.
+    """
+    if external_session_id:
+        row = connection.execute("SELECT * FROM sessions WHERE external_session_id=?", (external_session_id,)).fetchone()
+        if row:
+            return _touch_session(connection, row, created_at, protocol, model, conversation_fingerprint)
+        return _insert_session(
+            connection, external_session_id=external_session_id, fingerprint=conversation_fingerprint,
+            created_at=created_at, protocol=protocol, model=model, client_type=client_type,
         )
-        return str(row["id"])
+
+    if conversation_fingerprint:
+        candidate = connection.execute(
+            "SELECT * FROM sessions WHERE conversation_fingerprint=? ORDER BY last_seen_at DESC LIMIT 1",
+            (conversation_fingerprint,),
+        ).fetchone()
+        if candidate and _fingerprint_session_compatible(connection, candidate["id"], incoming_messages):
+            return _touch_session(connection, candidate, created_at, protocol, model, conversation_fingerprint)
+        return _insert_session(
+            connection, external_session_id=None, fingerprint=conversation_fingerprint,
+            created_at=created_at, protocol=protocol, model=model, client_type=client_type,
+        )
+
+    row = connection.execute("SELECT * FROM sessions WHERE external_session_id=?", (fallback_id,)).fetchone()
+    if row:
+        return _touch_session(connection, row, created_at, protocol, model, None)
+    return _insert_session(
+        connection, external_session_id=fallback_id, fingerprint=None,
+        created_at=created_at, protocol=protocol, model=model, client_type=client_type,
+    )
+
+
+def _touch_session(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+    created_at: str,
+    protocol: str,
+    model: str | None,
+    fingerprint: str | None,
+) -> str:
+    protocols = list(dict.fromkeys([*json.loads(row["protocols_json"]), protocol]))
+    models = list(dict.fromkeys([*json.loads(row["models_json"]), *([model] if model else [])]))
+    connection.execute(
+        """UPDATE sessions SET last_seen_at=?, protocols_json=?, models_json=?,
+           call_count=call_count+1, conversation_fingerprint=COALESCE(?, conversation_fingerprint) WHERE id=?""",
+        (created_at, json.dumps(protocols), json.dumps(models), fingerprint, row["id"]),
+    )
+    return str(row["id"])
+
+
+def _insert_session(
+    connection: sqlite3.Connection,
+    *,
+    external_session_id: str | None,
+    fingerprint: str | None,
+    created_at: str,
+    protocol: str,
+    model: str | None,
+    client_type: str,
+) -> str:
     session_id = str(uuid.uuid4())
     connection.execute(
         """INSERT INTO sessions (
             id, external_session_id, created_at, last_seen_at, client_type,
-            protocols_json, models_json, call_count
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 1)""",
-        (session_id, external, created_at, created_at, client_type, json.dumps([protocol]), json.dumps([model] if model else [])),
+            protocols_json, models_json, call_count, conversation_fingerprint
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)""",
+        (session_id, external_session_id, created_at, created_at, client_type,
+         json.dumps([protocol]), json.dumps([model] if model else []), fingerprint),
     )
     return session_id
+
+
+def _fingerprint_session_compatible(
+    connection: sqlite3.Connection,
+    session_record_id: str,
+    incoming_messages: list[dict[str, Any]],
+) -> bool:
+    """A fingerprint match is reused only when the conversation provably continues.
+
+    With raw bodies stored, verify the session's last trace messages are a prefix of
+    the incoming messages. Without raw bodies, fall back to a recency window so a
+    stale same-opener session does not swallow a brand-new conversation.
+    """
+    if not incoming_messages:
+        return True
+    row = connection.execute(
+        """SELECT request_body_json FROM traces
+           WHERE session_record_id=? AND request_body_json IS NOT NULL
+           ORDER BY created_at DESC LIMIT 1""",
+        (session_record_id,),
+    ).fetchone()
+    if row is None:
+        last_seen = connection.execute("SELECT last_seen_at FROM sessions WHERE id=?", (session_record_id,)).fetchone()
+        if last_seen is None:
+            return False
+        try:
+            seen = datetime.fromisoformat(last_seen[0])
+        except (ValueError, TypeError):
+            return False
+        window_hours = float(os.getenv("AUTOMODE_SESSION_FINGERPRINT_WINDOW_HOURS", "72"))
+        return (datetime.now(timezone.utc) - seen).total_seconds() <= window_hours * 3600
+    try:
+        previous = json.loads(row[0])
+    except json.JSONDecodeError:
+        return True
+    previous_messages = extract_messages(previous)
+    if not previous_messages:
+        return True
+    # Same conversation lineage: one message list is a prefix of the other. The
+    # reverse direction matters when re-grouping historical traces out of order,
+    # where an older (shorter) trace is checked against a session whose latest
+    # trace is newer.
+    return (
+        messages_are_continuation(previous_messages, incoming_messages)
+        or messages_are_continuation(incoming_messages, previous_messages)
+    )
+
+
+def _merge_authorization_values(current: dict[str, Any], signals: dict[str, Any]) -> dict[str, Any]:
+    """Pure merge of per-request authorization signals into a session baseline.
+
+    Capabilities and constraints accumulate (standing instructions stay in force for
+    the session); statements are deduplicated by text and bounded to the most recent.
+    """
+    capabilities = list(dict.fromkeys([*current.get("capabilities", []), *signals.get("capabilities", [])]))
+    forbidden = list(dict.fromkeys([*current.get("forbidden_capabilities", []), *signals.get("forbidden_capabilities", [])]))
+    statements = list(current.get("statements", []))
+    seen = {_statement_key(item) for item in statements}
+    for item in signals.get("statements", []) or []:
+        key = _statement_key(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        statements.append(item)
+    return {"capabilities": capabilities, "forbidden_capabilities": forbidden, "statements": statements[-40:]}
+
+
+def _merge_authorization(
+    connection: sqlite3.Connection,
+    session_record_id: str,
+    signals: dict[str, Any],
+) -> dict[str, Any]:
+    row = connection.execute("SELECT authorization_json FROM sessions WHERE id=?", (session_record_id,)).fetchone()
+    current = json.loads(row[0] or "{}") if row and row[0] else {}
+    return _merge_authorization_values(current, signals)
+
+
+def _statement_key(item: Any) -> str:
+    if not isinstance(item, dict):
+        return str(item)
+    return hashlib.sha256(str(item.get("text", "")).encode()).hexdigest()
 
 
 def _client_type(headers: dict[str, str]) -> str:
@@ -829,6 +1213,19 @@ def _rule_row(row: sqlite3.Row) -> dict[str, Any]:
 
 def _alert_row(row: sqlite3.Row) -> dict[str, Any]:
     return _json_row(row, ("evidence_json", "actions_json", "matched_rules_json"))
+
+
+def _tool_action_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "tool_name": row["tool_name"],
+        "arguments": json.loads(row["arguments_json"] or "null"),
+        "capability": row["capability"],
+        "target": row["target"],
+        "side_effect": row["side_effect"],
+        "risk": row["risk"],
+        "action_hash": row["action_hash"],
+        "created_at": row["created_at"],
+    }
 
 
 def _percentile(values: list[float], fraction: float) -> float:

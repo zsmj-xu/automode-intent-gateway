@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Demo B · 安全运营大屏 · AutoMode 控制台</title>
+<style>
+  :root{
+    --bg:#070b14; --surface:#0f1522; --surface-2:#161e2e; --line:#242e42; --muted:#8b98ad;
+    --text:#e9edf5; --accent:#5b8bff; --safe:#2dd4a0; --warn:#fbbf24; --danger:#fb7185; --critical:#f43f5e;
+    --read:#5b9dff; --write:#fbbf24; --execute:#fb923c; --delete:#ef4444; --publish:#a78bfa;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:Inter,"SF Pro Text","PingFang SC",system-ui,sans-serif;color:var(--text);background:var(--bg);height:100vh;overflow:hidden}
+  .app{display:flex;flex-direction:column;height:100vh}
+  /* top nav */
+  .nav{display:flex;align-items:center;gap:6px;padding:0 18px;height:54px;border-bottom:1px solid var(--line);background:rgba(9,13,22,.92)}
+  .logo{display:flex;align-items:center;gap:9px;font-weight:800;margin-right:16px;font-size:14px}
+  .logo i{width:28px;height:28px;border-radius:8px;background:linear-gradient(145deg,#5b8bff,#3352c9);display:inline-grid;place-items:center;font-style:normal;color:#fff;font-size:12px}
+  .nav .tab{border:0;background:transparent;color:var(--muted);padding:7px 13px;border-radius:8px;font-size:13px;cursor:pointer}
+  .nav .tab:hover{color:var(--text);background:#131a29}
+  .nav .tab.active{color:#c9d6ff;background:#1a2440}
+  .nav .spacer{flex:1}
+  .live{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--safe)}
+  .live i{width:8px;height:8px;border-radius:50%;background:var(--safe);box-shadow:0 0 0 4px #2dd4a01f;animation:pulse 2s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+  .cmd{font:700 11px/1 ui-monospace,monospace;color:var(--muted);border:1px solid var(--line);border-radius:6px;padding:5px 9px}
+  /* KPI band */
+  .kpis{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;padding:14px 18px}
+  .kpi{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:14px 16px;position:relative;overflow:hidden}
+  .kpi .l{font-size:12px;color:var(--muted)}
+  .kpi .v{font-size:28px;font-weight:800;letter-spacing:-.03em;margin-top:4px}
+  .kpi .d{font-size:11px;color:var(--muted);margin-top:3px}
+  .kpi .spark{position:absolute;right:10px;bottom:10px;width:88px;height:26px;opacity:.9}
+  .kpi.danger .v{color:var(--danger)} .kpi.safe .v{color:var(--safe)} .kpi.warn .v{color:var(--warn)}
+  .delta{font-size:11px;font-weight:700}
+  .delta.up{color:var(--danger)}.delta.down{color:var(--safe)}
+  /* main grid */
+  .grid{flex:1;min-height:0;display:grid;grid-template-columns:1.5fr 1fr;grid-template-rows:1fr 1fr;gap:12px;padding:0 18px 18px}
+  .panel{background:var(--surface);border:1px solid var(--line);border-radius:12px;display:flex;flex-direction:column;min-height:0;overflow:hidden}
+  .p-head{display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--line)}
+  .p-head h2{font-size:13px;margin:0;font-weight:700}
+  .p-head .sub{font-size:11px;color:var(--muted)}
+  .p-head .spacer{flex:1}
+  .seg{display:flex;border:1px solid var(--line);border-radius:7px;overflow:hidden}
+  .seg button{border:0;background:transparent;color:var(--muted);font-size:11px;padding:5px 10px;cursor:pointer}
+  .seg button.on{background:#1a2440;color:#c9d6ff}
+  .p-body{flex:1;min-height:0;overflow-y:auto}
+  /* event stream */
+  .evt{display:grid;grid-template-columns:56px 1fr auto;gap:10px;padding:9px 14px;border-bottom:1px solid #18202f;align-items:center;font-size:12px}
+  .evt time{font:700 10px/1 ui-monospace,monospace;color:var(--muted)}
+  .evt .t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#c8d2e4}
+  .evt .t b{color:var(--text)}
+  .evt .badge{font:700 9px/1 ui-monospace,monospace;text-transform:uppercase;letter-spacing:.04em;padding:3px 7px;border-radius:5px;border:1px solid}
+  .badge.allow{color:var(--safe);border-color:#1e6e52}.badge.alert{color:var(--danger);border-color:#7a2c38}
+  .badge.stage{color:var(--accent);border-color:#2a4a8a}.badge.rule{color:#c4a7e9;border-color:#4a3a7a}
+  /* alert queue */
+  .alert{display:grid;grid-template-columns:auto 1fr auto;gap:11px;padding:11px 14px;border-bottom:1px solid #18202f;align-items:start;cursor:pointer}
+  .alert:hover{background:#131a29}
+  .alert .sev{width:8px;height:8px;border-radius:50%;margin-top:6px}
+  .sev.high{background:var(--danger);box-shadow:0 0 0 4px #fb71851c}.sev.critical{background:var(--critical);box-shadow:0 0 0 4px #f43f5e22}
+  .alert .b{font-size:12.5px;font-weight:650}
+  .alert .r{font-size:11px;color:var(--muted);margin-top:3px;font-family:ui-monospace,monospace}
+  .alert .acts{display:flex;gap:5px;flex-wrap:wrap;margin-top:7px}
+  .alert .acts button{border:1px solid var(--line);background:#141b2a;color:#aeb9cd;border-radius:6px;font-size:10px;padding:4px 8px;cursor:pointer}
+  .alert .acts button:hover{border-color:#3a4a6a;color:#fff}
+  .alert .acts button.primary{background:#0e2a22;color:var(--safe);border-color:#1e6e52}
+  /* risk distribution mini bars */
+  .dist{padding:14px 16px;display:grid;gap:12px}
+  .drow{display:grid;grid-template-columns:64px 1fr 34px;gap:10px;align-items:center;font-size:11px}
+  .drow .cap{margin:0}
+  .cap{font:700 9px/1 ui-monospace,monospace;text-transform:uppercase;letter-spacing:.05em;padding:2px 6px;border-radius:4px;border:1px solid;width:max-content}
+  .cap.read{color:var(--read);border-color:#2a4a7a}.cap.write{color:var(--write);border-color:#6b5212}.cap.execute{color:var(--execute);border-color:#7a4214}.cap.delete{color:var(--delete);border-color:#7a222e}.cap.publish{color:var(--publish);border-color:#4a3a7a}.cap.unknown{color:#94a3b8;border-color:#3c4b68}
+  .bar{height:8px;border-radius:4px;background:#161e2e;overflow:hidden}
+  .bar i{display:block;height:100%;border-radius:4px}
+  .drow b{text-align:right;font:700 11px/1 ui-monospace,monospace}
+  .status{font:700 9px/1 ui-monospace,monospace;text-transform:uppercase;letter-spacing:.04em;padding:2px 7px;border-radius:5px}
+  .status.open{background:#2a1116;color:var(--danger)}.status.ack{background:#33240f;color:var(--warn)}.status.resolved{background:#0e2a22;color:var(--safe)}
+  .foot{grid-column:1/-1;display:none}
+  @media(max-width:900px){.grid{grid-template-columns:1fr}.kpis{grid-template-columns:repeat(2,1fr)}}
+</style>
+</head>
+<body>
+<div class="app">
+  <nav class="nav">
+    <span class="logo"><i>AM</i>AutoMode 运营</span>
+    <button class="tab">总览</button>
+    <button class="tab active">运营大屏</button>
+    <button class="tab">会话</button>
+    <button class="tab">告警</button>
+    <button class="tab">规则</button>
+    <span class="spacer"></span>
+    <span class="live"><i></i>实时 · 3 条未处理告警</span>
+    <span class="cmd">⌘K</span>
+  </nav>
+
+  <section class="kpis">
+    <div class="kpi"><div class="l">模型调用 / 24h</div><div class="v">1,284</div><div class="d">会话 86 · <span class="delta up">+18%</span></div>
+      <svg class="spark" viewBox="0 0 88 26"><polyline fill="none" stroke="#5b8bff" stroke-width="1.6" points="0,20 10,17 20,19 30,13 40,15 50,9 60,11 70,6 80,8 88,3"/></svg></div>
+    <div class="kpi safe"><div class="l">允许率</div><div class="v">94.2%</div><div class="d">1,210 次允许</div>
+      <svg class="spark" viewBox="0 0 88 26"><polyline fill="none" stroke="#2dd4a0" stroke-width="1.6" points="0,6 10,7 20,5 30,6 40,4 50,5 60,3 70,4 80,2 88,3"/></svg></div>
+    <div class="kpi danger"><div class="l">开放告警</div><div class="v">3</div><div class="d">累计 74 · <span class="delta up">+2</span></div></div>
+    <div class="kpi warn"><div class="l">Deep 复核占比</div><div class="v">6.1%</div><div class="d">P95 延迟 1.4s</div></div>
+    <div class="kpi"><div class="l">分类 P95</div><div class="v">812 ms</div><div class="d">P50 96 ms</div></div>
+  </section>
+
+  <div class="grid">
+    <section class="panel" style="grid-row:1/3">
+      <div class="p-head"><h2>实时事件流</h2><span class="sub">SSE 增量 · 点击事件跳转定位</span><span class="spacer"></span>
+        <div class="seg"><button class="on">全部</button><button>告警</button><button>分类</button></div>
+      </div>
+      <div class="p-body" id="events"></div>
+    </section>
+
+    <section class="panel">
+      <div class="p-head"><h2>待处置告警</h2><span class="sub">一键 triage</span><span class="spacer"></span><button class="seg" style="border:none;color:var(--accent);font-size:11px;background:none;cursor:pointer">全部告警 →</button></div>
+      <div class="p-body" id="alerts"></div>
+    </section>
+
+    <section class="panel">
+      <div class="p-head"><h2>风险与能力分布</h2><span class="sub">近 24h</span></div>
+      <div class="dist">
+        <div class="drow"><span class="cap read">read</span><div class="bar"><i style="width:72%;background:var(--read)"></i></div><b>923</b></div>
+        <div class="drow"><span class="cap write">write</span><div class="bar"><i style="width:18%;background:var(--write)"></i></div><b>231</b></div>
+        <div class="drow"><span class="cap execute">execute</span><div class="bar"><i style="width:9%;background:var(--execute)"></i></div><b>117</b></div>
+        <div class="drow"><span class="cap publish">publish</span><div class="bar"><i style="width:5%;background:var(--publish)"></i></div><b>64</b></div>
+        <div class="drow"><span class="cap delete">delete</span><div class="bar"><i style="width:2%;background:var(--delete)"></i></div><b>26</b></div>
+      </div>
+    </section>
+  </div>
+</div>
+
+<script>
+const events = [
+  {t:'14:32:08', b:'alert', txt:'<b>payment-api</b> · Bash(git push --force) · contradict 违背约束', a:'contradicted'},
+  {t:'14:32:08', b:'stage', txt:'deep_llm 完成 · verdict=reject · 1.4s', a:''},
+  {t:'14:31:52', b:'allow', txt:'<b>payment-api</b> · Bash(kubectl logs) · 规则短路允许', a:''},
+  {t:'14:30:11', b:'alert', txt:'<b>数据迁移</b> · rm -rf /data/old · 高影响', a:''},
+  {t:'14:28:44', b:'rule', txt:'规则 r1:3 已启用 · PUBLISH_ALWAYS_ALERT', a:''},
+  {t:'14:26:02', b:'allow', txt:'<b>周报生成</b> · 文本响应 · 无需分类', a:''},
+  {t:'14:21:03', b:'alert', txt:'<b>payment-api</b> · deploy(production) · 规则告警', a:''},
+  {t:'14:19:40', b:'stage', txt:'fast_llm 完成 · verdict=allow · 96ms', a:''},
+  {t:'14:18:22', b:'allow', txt:'<b>CI 修复</b> · Bash(git status) · read 只读', a:''},
+];
+const alerts = [
+  {sev:'critical', title:'CRITICAL: rm requires attention', reason:'DESTRUCTIVE_TOOL_ACTION', tool:'Bash(rm -rf /data/old)', status:'open'},
+  {sev:'critical', title:'CRITICAL: deploy requires attention', reason:'PUBLISH_ALWAYS_ALERT · r1:3', tool:'deploy(production)', status:'open'},
+  {sev:'high', title:'HIGH: Bash requires attention', reason:'ACTION_CONTRADICTS_USER_CONSTRAINT', tool:'Bash(git push --force)', status:'open'},
+  {sev:'high', title:'HIGH: send_message requires attention', reason:'EXTERNAL_STATE_CHANGE', tool:'send_message(external)', status:'ack'},
+];
+
+function badge(b){return b==='allow'?'<span class="badge allow">allow</span>':b==='alert'?'<span class="badge alert">alert</span>':b==='stage'?'<span class="badge stage">stage</span>':'<span class="badge rule">rule</span>'}
+document.getElementById('events').innerHTML = events.map(e=>`<div class="evt"><time>${e.t}</time><div class="t">${e.txt}</div>${e.b==='allow'||e.b==='alert'?badge(e.b):badge(e.b)}</div>`).join('');
+
+document.getElementById('alerts').innerHTML = alerts.map((a,i)=>`
+  <div class="alert">
+    <span class="sev ${a.sev==='critical'?'critical':'high'}"></span>
+    <div>
+      <div class="b">${a.title}</div>
+      <div class="r">${a.reason}</div>
+      <div class="acts">
+        <button class="primary">ack</button>
+        <button>误报</button>
+        <button>resolved</button>
+        <button>↗ 时间线定位</button>
+      </div>
+    </div>
+    <span class="status ${a.status==='open'?'open':'ack'}">${a.status}</span>
+  </div>`).join('');
+
+document.querySelectorAll('.alert .acts button').forEach((b,i)=>{
+  b.addEventListener('click', e=>{ e.stopPropagation(); const row=b.closest('.alert'); row.querySelector('.status').textContent = b.textContent==='ack'?'ack':'resolved'; row.querySelector('.status').className='status ack'; });
+});
+</script>
+</body>
+</html>

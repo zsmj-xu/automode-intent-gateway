@@ -15,13 +15,15 @@ from aiohttp import ClientSession, ClientTimeout, web
 from multidict import CIMultiDict
 
 from .admin_api import register_admin_routes
+from .classifier import authorization_signals
 from .events import EVENT_BROKER_KEY, EventBroker
 from .normalizer import normalize
 from .pipeline import DecisionPipeline
-from .protocols import classification_payload, protocol_for_path, session_id_from
+from .protocols import classification_payload, protocol_for_path, session_evidence_from, session_id_from
 from .response_parser import extract_tool_calls
 from .review_context import build_review_context
 from .service import classify_payload
+from .session_fingerprint import conversation_fingerprint
 from .storage import TraceStore
 
 
@@ -146,12 +148,16 @@ class Gateway:
             error = type(exc).__name__
             raise web.HTTPBadGateway(text=f"upstream request failed: {error}") from exc
         finally:
+            session_evidence = session_evidence_from(payload, inbound_headers)
+            session_signals: dict[str, Any] | None = None
             try:
                 analysis_payload = classification_payload(protocol, payload)
                 normalized = normalize(analysis_payload, source_format_override=protocol)
                 review_context = build_review_context(normalized)
                 latest_user_text = review_context.user_messages[-1] if review_context.user_messages else ""
                 declared_tool_count = len(normalized.tools)
+                session_evidence["fingerprint"] = conversation_fingerprint(normalized.messages)
+                session_signals = authorization_signals(review_context.user_messages)
             except (ValueError, TypeError, KeyError):
                 # Analysis is an observer: a new or malformed-but-upstream-accepted
                 # payload must never replace the upstream response with our error.
@@ -167,6 +173,9 @@ class Gateway:
                 "payload": payload,
                 "headers": inbound_headers,
                 "session_id": session_id_from(payload, inbound_headers),
+                "session_evidence": session_evidence,
+                "conversation_fingerprint": session_evidence.get("fingerprint"),
+                "session_signals": session_signals,
                 "latest_user_text": latest_user_text,
                 "declared_tool_count": declared_tool_count,
             }
@@ -181,6 +190,9 @@ class Gateway:
                 response_bytes=response_bytes,
                 latency_ms=latency_ms,
                 error=error,
+                response_body=bytes(response_capture) if capture_complete else None,
+                response_content_type=response_content_type,
+                response_capture_complete=capture_complete,
             )
             self.broker.publish("trace.completed", {"id": trace_id, "status": status, "error": error})
             if proposed_tool_calls is not None and analysis_payload is not None:
@@ -196,8 +208,9 @@ class Gateway:
         try:
             normalized = normalize(payload, source_format_override=protocol)
             active_rules = await asyncio.to_thread(self.store.enabled_rules)
+            session_baseline = await asyncio.to_thread(self.store.session_baseline_for_trace, trace_id)
             pipeline_result = await asyncio.to_thread(
-                DecisionPipeline().classify, normalized, proposed_tool_calls, active_rules
+                DecisionPipeline().classify, normalized, proposed_tool_calls, active_rules, session_baseline
             )
             result = pipeline_result.to_dict()
             run_id, alert_id = await asyncio.to_thread(self.store.save_pipeline, trace_id, result)

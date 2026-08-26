@@ -66,14 +66,51 @@ def _labels(text: str, groups: dict[str, tuple[str, ...]]) -> list[str]:
     return [name for name, patterns in groups.items() if _matches(text, patterns)]
 
 
+def authorization_signals(user_messages: list[str]) -> dict[str, Any]:
+    """Per-request authorization signals extracted from the conversation's user text.
+
+    Mirrors the per-turn analysis `classify` would run: explicit capability words plus
+    capabilities inferred from the detected intent. The service stores these per session
+    so later turns can be reviewed against the whole conversation, not only the latest
+    user message.
+    """
+    capabilities: list[str] = []
+    forbidden: list[str] = []
+    statements: list[dict[str, Any]] = []
+    for text in user_messages:
+        positive_text, requested, denied = _capabilities_and_constraints(text)
+        intents = _labels(positive_text, PATTERNS)
+        intent = intents[0] if intents else "general_chat"
+        requested = _infer_capabilities(intent, requested)
+        if requested or denied:
+            statements.append({
+                "text": text[:800],
+                "capabilities": requested,
+                "forbidden_capabilities": denied,
+            })
+        capabilities = _merge_unique(capabilities, requested)
+        forbidden = _merge_unique(forbidden, denied)
+    return {"capabilities": capabilities, "forbidden_capabilities": forbidden, "statements": statements}
+
+
+def _merge_unique(target: list[str], values: list[str]) -> list[str]:
+    return list(dict.fromkeys([*target, *values]))
+
+
 def classify(
     request: NormalizedRequest,
     proposed_tool_calls: list[dict[str, Any]] | None = None,
+    session_baseline: dict[str, Any] | None = None,
 ) -> Classification:
-    context = build_review_context(request, proposed_tool_calls)
+    context = build_review_context(request, proposed_tool_calls, session_baseline=session_baseline)
     latest_user_text = context.user_messages[-1] if context.user_messages else ""
     all_user_text = "\n".join(context.user_messages)
     positive_text, capabilities, forbidden_capabilities = _capabilities_and_constraints(all_user_text)
+    if session_baseline:
+        # The authorization baseline is session-wide: constraints given turns ago
+        # still bound the current action, and scope authorized earlier remains in force.
+        capabilities = _merge_unique(capabilities, session_baseline.get("capabilities") or [])
+        forbidden_capabilities = _merge_unique(forbidden_capabilities, session_baseline.get("forbidden_capabilities") or [])
     latest_positive, _, latest_forbidden = _capabilities_and_constraints(latest_user_text)
     intents = _labels(latest_positive, PATTERNS)
     intent = intents[0] if intents else "general_chat"

@@ -4,7 +4,7 @@ from pathlib import Path
 
 from automode_gateway.gateway import _join_url, _request_headers
 from automode_gateway.normalizer import normalize
-from automode_gateway.protocols import classification_payload, protocol_for_path
+from automode_gateway.protocols import classification_payload, protocol_for_path, session_evidence_from, session_id_from
 from automode_gateway.storage import TraceStore
 
 
@@ -45,6 +45,15 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(headers["Authorization"], "Bearer test")
         self.assertEqual(headers["x-automode-trace-id"], "trace-1")
 
+    def test_session_evidence_distinguishes_explicit_session_from_trace(self) -> None:
+        payload = {"metadata": {"trace_id": "request-1"}, "model": "m"}
+        self.assertIsNone(session_id_from(payload, {"x-trace-id": "request-1"}))
+        missing = session_evidence_from(payload, {"x-trace-id": "request-1"})
+        self.assertEqual(missing["status"], "missing")
+        self.assertEqual(missing["candidates"][0]["field"], "metadata.trace_id")
+        explicit = session_evidence_from(payload, {"x-session-id": "session-1"})
+        self.assertEqual(explicit["selected"]["value"], "session-1")
+
 
 class StorageTests(unittest.TestCase):
     def test_trace_store_redacts_auth_header(self) -> None:
@@ -64,12 +73,21 @@ class StorageTests(unittest.TestCase):
                 trace_id,
                 {"intent": "general_chat", "speech_act": "directive", "risk": "low", "decision": "allow"},
             )
-            store.finish(trace_id, status=200, response_bytes=12, latency_ms=3.5)
+            store.finish(
+                trace_id,
+                status=200,
+                response_bytes=12,
+                latency_ms=3.5,
+                response_body=b'{"choices":[{"message":{"role":"assistant","content":"hello"}}]}',
+                response_content_type="application/json",
+            )
             row = store.get(trace_id)
             self.assertIsNotNone(row)
             assert row is not None
             self.assertEqual(row["request_headers"]["authorization"], "[REDACTED]")
             self.assertEqual(row["request_body"]["model"], "gpt-test")
+            self.assertEqual(row["session_evidence"]["status"], "missing")
+            self.assertEqual(row["response_body"]["data"]["choices"][0]["message"]["content"], "hello")
             self.assertEqual(row["decision"], "allow")
             self.assertEqual(row["response_status"], 200)
 

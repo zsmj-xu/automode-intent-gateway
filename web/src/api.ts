@@ -58,6 +58,4 @@ export const post = <T>(path: string, body: unknown) =>
 export const patch = <T>(path: string, body: unknown) =>
   api<T>(path, { method: 'PATCH', body: JSON.stringify(body) })
 
-export function formatTime(value?: string): string {
-  return value ? new Intl.DateTimeFormat('zh-CN', { dateStyle: 'short', timeStyle: 'medium' }).format(new Date(value)) : '—'
-}
+export const del = <T>(path: string) => api<T>(path, { method: 'DELETE' })

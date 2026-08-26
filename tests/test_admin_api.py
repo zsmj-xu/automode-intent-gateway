@@ -168,6 +168,20 @@ class AdminApiTests(unittest.IsolatedAsyncioTestCase):
         deep = [item for item in timeline if item.get("stage") == "deep_llm"][0]
         self.assertEqual(deep["reason_code"], "USER_CONSTRAINT")
         self.assertEqual(deep["latency_ms"], 1)
+        async with self.client.get(self.server.make_url(f"/api/sessions/{session['id']}/detail")) as response:
+            detail = await response.json()
+        self.assertEqual(detail["session"]["external_session_id"], "session-api")
+        self.assertEqual(len(detail["traces"]), 1)
+        trace_detail = detail["traces"][0]
+        self.assertEqual(trace_detail["trace_id"], trace_id)
+        self.assertEqual(trace_detail["latest_user_text"], "不要 push")
+        self.assertEqual(trace_detail["tool_actions"][0]["tool_name"], "Bash")
+        self.assertEqual(trace_detail["tool_actions"][0]["arguments"], {"command": "git push"})
+        self.assertEqual(trace_detail["classification"]["final_decision"], "alert")
+        self.assertEqual(trace_detail["classification"]["action_alignment"], "contradicted")
+        self.assertEqual(trace_detail["classification"]["review_transcript"], [{"type": "user", "text": "不要 push"}])
+        self.assertEqual(len(trace_detail["alerts"]), 1)
+        self.assertEqual(trace_detail["alerts"][0]["reason_code"], "USER_CONSTRAINT")
         async with self.client.get(self.server.make_url(f"/api/sessions/{session['id']}")) as response:
             self.assertEqual((await response.json())["external_session_id"], "session-api")
         async with self.client.get(self.server.make_url(f"/api/traces/{trace_id}/classification")) as response:

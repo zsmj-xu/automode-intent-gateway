@@ -68,15 +68,34 @@ def _response_item_to_message(item: Any) -> dict[str, Any] | None:
     return None
 
 
-def session_id_from(payload: dict[str, Any], headers: dict[str, str]) -> str | None:
-    for name in ("x-claude-code-session-id", "x-session-id", "x-trace-id"):
+def session_evidence_from(payload: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
+    candidates: list[dict[str, str]] = []
+    for name in ("x-claude-code-session-id", "x-session-id"):
         value = headers.get(name)
         if value:
-            return value
+            candidates.append({"source": "header", "field": name, "value": value})
     metadata = payload.get("metadata")
     if isinstance(metadata, dict):
-        for key in ("session_id", "trace_id", "conversation_id"):
+        for key in ("session_id", "conversation_id", "trace_id"):
             value = metadata.get(key)
             if isinstance(value, str) and value:
-                return value
-    return None
+                candidates.append({"source": "metadata", "field": f"metadata.{key}", "value": value})
+    for key in ("conversation", "previous_response_id", "response_id"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            candidates.append({"source": "responses", "field": key, "value": value})
+    selected = next((item for item in candidates if item["field"] in {
+        "x-claude-code-session-id", "x-session-id", "metadata.session_id",
+        "metadata.conversation_id", "conversation", "previous_response_id",
+    }), None)
+    return {
+        "status": "provided" if selected else "missing",
+        "selected": selected,
+        "candidates": candidates,
+    }
+
+
+def session_id_from(payload: dict[str, Any], headers: dict[str, str]) -> str | None:
+    evidence = session_evidence_from(payload, headers)
+    selected = evidence.get("selected")
+    return selected.get("value") if selected else None

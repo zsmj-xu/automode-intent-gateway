@@ -24,11 +24,12 @@ class DecisionPipeline:
         request: NormalizedRequest,
         proposed_tool_calls: list[dict[str, Any]],
         rules: Iterable[dict[str, Any]] = (),
+        session_baseline: dict[str, Any] | None = None,
     ) -> PipelineResult:
         started = time.perf_counter()
-        context = build_review_context(request, proposed_tool_calls)
+        context = build_review_context(request, proposed_tool_calls, session_baseline=session_baseline)
         transcript = context.classifier_transcript()
-        rule_stage, baseline = evaluate_rules(request, proposed_tool_calls, rules)
+        rule_stage, baseline = evaluate_rules(request, proposed_tool_calls, rules, session_baseline=session_baseline)
         stages: list[StageResult] = [rule_stage]
 
         if rule_stage.verdict == "SAFE":

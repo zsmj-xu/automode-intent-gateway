@@ -57,6 +57,7 @@ class ReviewContext:
 def build_review_context(
     request: NormalizedRequest,
     proposed_tool_calls: list[dict[str, Any]] | None = None,
+    session_baseline: dict[str, Any] | None = None,
 ) -> ReviewContext:
     user_messages: list[str] = []
     historical: list[ToolIntent] = []
@@ -81,6 +82,25 @@ def build_review_context(
         {"type": "tool_call", "phase": "proposed", **call.to_dict()}
         for call in proposed
     )
+
+    if session_baseline:
+        statements = [
+            str(item.get("text", ""))[:400]
+            for item in (session_baseline.get("statements") or [])
+            if isinstance(item, dict) and item.get("text")
+        ]
+        if statements or session_baseline.get("capabilities") or session_baseline.get("forbidden_capabilities"):
+            # Session-wide authorization context survives transcript trimming (appended
+            # last) and lets the reviewers judge the current action against the whole
+            # conversation even when the request only carries the latest turn.
+            events.append({
+                "type": "session_authorization",
+                "phase": "session",
+                "capabilities": list(dict.fromkeys(session_baseline.get("capabilities") or [])),
+                "forbidden_capabilities": list(dict.fromkeys(session_baseline.get("forbidden_capabilities") or [])),
+                "statements": statements[-10:],
+            })
+
     return ReviewContext(
         user_messages=user_messages,
         historical_tool_calls=historical,

@@ -51,9 +51,10 @@ def evaluate_rules(
     request: NormalizedRequest,
     proposed_tool_calls: list[dict[str, Any]],
     rules: Iterable[dict[str, Any]] = (),
+    session_baseline: dict[str, Any] | None = None,
 ) -> tuple[StageResult, dict[str, Any]]:
     started = time.perf_counter()
-    baseline = classify(request, proposed_tool_calls)
+    baseline = classify(request, proposed_tool_calls, session_baseline=session_baseline)
     actions = baseline.proposed_tool_calls
     matches: list[CompiledRule] = []
     for raw in rules:
@@ -90,7 +91,15 @@ def evaluate_rules(
         reason_code = baseline.reason_codes[-1]
         reason = baseline.summary
 
-    evidence = list(dict.fromkeys([*request.user_text.splitlines(), *[rule.reason for rule in matches]]))[:8]
+    evidence_sources: list[str] = []
+    if session_baseline:
+        evidence_sources.extend(
+            str(item.get("text", ""))
+            for item in (session_baseline.get("statements") or [])
+            if isinstance(item, dict) and item.get("text")
+        )
+    evidence_sources.extend([*request.user_text.splitlines(), *[rule.reason for rule in matches]])
+    evidence = list(dict.fromkeys(evidence_sources))[:8]
     stage = StageResult(
         stage="rules",
         status="completed",

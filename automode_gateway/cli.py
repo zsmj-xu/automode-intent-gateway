@@ -33,6 +33,9 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="do not persist complete request JSON",
     )
+
+    backfill_cmd = sub.add_parser("backfill", help="regroup historical traces into conversation sessions")
+    backfill_cmd.add_argument("--db", default=os.getenv("AUTOMODE_DB", "automode.db"))
     return parser
 
 
@@ -42,6 +45,13 @@ def main() -> None:
         if not args.upstream:
             raise SystemExit("--upstream or AUTOMODE_UPSTREAM_BASE_URL is required")
         run_gateway(args.host, args.port, args.upstream, args.db, not args.no_store_raw)
+        return
+
+    if args.command == "backfill":
+        from .storage import TraceStore
+
+        stats = TraceStore(args.db).backfill_sessions()
+        print(json.dumps(stats, ensure_ascii=False, indent=2))
         return
 
     stream: TextIO

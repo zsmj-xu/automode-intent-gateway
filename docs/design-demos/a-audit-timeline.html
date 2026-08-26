@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Demo A · 审计时间线 · AutoMode 控制台</title>
+<style>
+  :root{
+    --bg:#090d18; --surface:#111725; --surface-2:#171e2e; --line:#273043; --muted:#93a0b5;
+    --text:#e8ecf4; --accent:#6e8bff; --safe:#34d399; --warn:#fbbf24; --danger:#fb7185; --critical:#ef4444;
+    --read:#5b9dff; --write:#fbbf24; --execute:#fb923c; --delete:#ef4444; --publish:#a78bfa; --unknown:#94a3b8;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:Inter,"SF Pro Text","PingFang SC",system-ui,sans-serif;color:var(--text);background:radial-gradient(circle at 70% -10%,#172349 0,transparent 36%),var(--bg);height:100vh;overflow:hidden}
+  .app{display:grid;grid-template-columns:68px 320px 1fr;height:100vh}
+  /* icon rail */
+  .rail{background:rgba(10,15,27,.96);border-right:1px solid var(--line);display:flex;flex-direction:column;align-items:center;padding:14px 0;gap:6px}
+  .rail .logo{width:40px;height:40px;border-radius:11px;background:linear-gradient(145deg,#667eea,#4051b5);display:grid;place-items:center;font-weight:800;color:#fff;margin-bottom:14px;font-size:15px}
+  .rail button{width:44px;height:44px;border:0;border-radius:11px;background:transparent;color:var(--muted);display:grid;place-items:center;cursor:pointer;position:relative}
+  .rail button:hover{background:#151d2e;color:var(--text)}
+  .rail button.active{background:#1d2742;color:#c7d2ff}
+  .rail button svg{width:20px;height:20px}
+  .rail .dot{position:absolute;top:8px;right:8px;min-width:16px;height:16px;border-radius:8px;background:var(--danger);color:#fff;font-size:10px;font-weight:700;display:grid;place-items:center;padding:0 4px}
+  .rail .spacer{flex:1}
+  .rail .live{width:9px;height:9px;border-radius:50%;background:var(--safe);box-shadow:0 0 0 4px #34d39920}
+  /* session list */
+  .list{background:rgba(11,16,28,.85);border-right:1px solid var(--line);display:flex;flex-direction:column;min-width:0}
+  .list-head{padding:16px 16px 12px;border-bottom:1px solid var(--line)}
+  .list-head h1{font-size:15px;margin:0 0 10px;letter-spacing:-.01em}
+  .search{width:100%;background:var(--surface-2);border:1px solid var(--line);border-radius:9px;color:var(--text);padding:9px 12px;font-size:13px}
+  .search:focus{outline:2px solid #9fb0ff;outline-offset:1px}
+  .chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+  .chip{display:inline-flex;align-items:center;gap:6px;border:1px solid #3c4b68;background:#101827;color:#9fb0d3;border-radius:20px;padding:4px 10px;font-size:11px;cursor:pointer}
+  .chip.on{background:#1d2742;color:#c7d2ff;border-color:var(--accent)}
+  .chip .x{opacity:.6}
+  .sessions{flex:1;overflow-y:auto;padding:8px}
+  .s-row{width:100%;text-align:left;border:0;background:transparent;border-radius:10px;padding:11px 12px;margin-bottom:4px;cursor:pointer;color:var(--text)}
+  .s-row:hover{background:#141c2c}
+  .s-row.active{background:#1a2338;box-shadow:inset 2px 0 var(--accent)}
+  .s-row .t{font-weight:650;font-size:13px;display:flex;align-items:center;gap:7px;overflow:hidden;white-space:nowrap}
+  .s-row .t .badge{flex:0 0 auto;font:700 9px/1 ui-monospace,monospace;text-transform:uppercase;letter-spacing:.05em;color:#9fb0d3;border:1px solid #3c4b68;padding:3px 6px;border-radius:4px}
+  .s-row .m{font-size:11px;color:var(--muted);margin-top:5px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+  .s-row .meta{display:flex;align-items:center;gap:8px;margin-top:7px;font-size:11px;color:var(--muted)}
+  .s-row .meta .risk{margin-left:auto}
+  /* risk */
+  .risk{display:inline-flex;align-items:center;gap:4px;font:700 10px/1 ui-monospace,monospace;text-transform:uppercase}
+  .risk i{width:7px;height:7px;border-radius:50%;background:var(--safe)}
+  .risk.medium i{background:var(--warn)}.risk.medium{color:var(--warn)}
+  .risk.high i{background:var(--danger)}.risk.high{color:var(--danger)}
+  .risk.critical i{background:var(--critical)}.risk.critical{color:var(--critical)}
+  /* timeline */
+  .main{min-width:0;display:flex;flex-direction:column}
+  .topbar{height:56px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:12px;padding:0 20px;background:rgba(9,13,24,.7);backdrop-filter:blur(8px)}
+  .topbar .ttl{font-size:14px;font-weight:700}
+  .topbar .sub{font-size:11px;color:var(--muted);font-family:ui-monospace,monospace}
+  .topbar .spacer{flex:1}
+  .btn{border:1px solid var(--line);background:var(--surface-2);color:var(--text);border-radius:8px;padding:7px 12px;font-size:12px;cursor:pointer;display:inline-flex;align-items:center;gap:6px}
+  .btn:hover{border-color:#3c4b68}
+  .scroll{flex:1;overflow-y:auto;padding:20px;max-width:980px;margin:0 auto;width:100%}
+  /* trace card */
+  .card{background:var(--surface);border:1px solid var(--line);border-radius:12px;margin-bottom:18px;overflow:hidden}
+  .card-head{display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--line);background:var(--surface-2)}
+  .card-head .n{font:700 11px/1 ui-monospace,monospace;letter-spacing:.08em;color:#9fb0d3}
+  .card-head .state{font-weight:700;font-size:12px;padding:3px 9px;border-radius:6px}
+  .state.allow{background:#0e2a22;color:var(--safe)}.state.alert{background:#2a1116;color:var(--danger)}
+  .card-head .align{font-size:11px;color:var(--muted)}
+  .card-head time{margin-left:auto;font-size:11px;color:var(--muted)}
+  .card-body{padding:14px 16px;display:grid;gap:12px}
+  /* user bubble */
+  .lbl{font:750 10px/1 ui-monospace,monospace;letter-spacing:.12em;color:var(--muted);margin-bottom:7px;display:flex;align-items:center;gap:7px}
+  .lbl::after{content:'';flex:1;height:1px;background:var(--line)}
+  .msg{background:#0f1623;border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:8px;padding:10px 12px;font-size:12.5px;line-height:1.55;color:#d8deea;white-space:pre-wrap}
+  .history-btn{border:0;background:transparent;color:var(--accent-2,#91a5ff);font-size:11px;cursor:pointer;padding:4px 0;text-align:left}
+  /* tool calls */
+  .tool{display:flex;align-items:flex-start;gap:10px;background:#0f1623;border:1px solid var(--line);border-radius:8px;padding:10px 12px}
+  .tool .ic{width:26px;height:26px;border-radius:7px;display:grid;place-items:center;font:700 11px/1 ui-monospace,monospace;flex:0 0 auto}
+  .tool .nm{font-weight:700;font-size:12.5px}
+  .tool .cap{margin-left:6px}
+  .cap{font:700 9px/1 ui-monospace,monospace;text-transform:uppercase;letter-spacing:.05em;padding:2px 6px;border-radius:4px;border:1px solid}
+  .cap.read{color:var(--read);border-color:#2a4a7a}.cap.write{color:var(--write);border-color:#6b5212}.cap.execute{color:var(--execute);border-color:#7a4214}.cap.delete{color:var(--delete);border-color:#7a222e}.cap.publish{color:var(--publish);border-color:#4a3a7a}.cap.unknown{color:var(--unknown);border-color:#3c4b68}
+  .tool pre{margin:8px 0 0;padding:8px 10px;background:#0b111d;border:1px solid var(--line);border-radius:6px;font:11px/1.5 ui-monospace,monospace;color:#aebbd2;white-space:pre-wrap;overflow:auto;max-height:140px}
+  /* waterfall */
+  .wf{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px}
+  .stage{border:1px solid var(--line);border-radius:9px;padding:10px;background:#0f1623;cursor:pointer;position:relative}
+  .stage .sn{font:750 9px/1 ui-monospace,monospace;letter-spacing:.08em;color:var(--muted)}
+  .stage .v{font-weight:700;font-size:12.5px;margin-top:6px}
+  .stage .r{font-size:10px;color:var(--muted);margin-top:4px;font-family:ui-monospace,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .stage.done{border-top:3px solid var(--accent)}
+  .stage.skipped{opacity:.55}
+  .stage.error{border-color:var(--danger);border-top:3px solid var(--danger)}
+  .stage.final{border-top:3px solid var(--safe)}
+  .stage.final.danger{border-top-color:var(--danger)}
+  .stage .more{display:none;margin-top:8px;padding-top:8px;border-top:1px solid var(--line);font-size:10.5px;color:var(--muted);line-height:1.5}
+  .stage.open .more{display:block}
+  .stage .k{color:#9fb0d3;font-family:ui-monospace,monospace}
+  /* review context */
+  .ctx{background:#0b111d;border:1px solid var(--line);border-radius:8px;padding:10px}
+  .ctx .ev{display:flex;gap:8px;padding:7px 0;border-bottom:1px dashed var(--line);font-size:12px;line-height:1.5}
+  .ctx .ev:last-child{border:0}
+  .ctx .tag{flex:0 0 auto;font:700 9px/1 ui-monospace,monospace;text-transform:uppercase;letter-spacing:.05em;padding:2px 6px;border-radius:4px;height:max-content}
+  .tag.user{background:#1d2742;color:#c7d2ff}.tag.hist{background:#2b2240;color:#c4a7e9}.tag.proposed{background:#2a1116;color:#ffb3c0}
+  details summary{cursor:pointer;color:#9fb0d3;font-size:11px;min-height:30px;display:flex;align-items:center}
+  details{margin-top:4px}
+  .footnote{text-align:center;color:var(--muted);font-size:11px;padding:6px 0 30px}
+  @media(max-width:960px){.app{grid-template-columns:60px 260px 1fr}}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="rail">
+    <div class="logo">A</div>
+    <button class="active" title="总览"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg></button>
+    <button title="会话"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg></button>
+    <button title="告警"><span class="dot">3</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></button>
+    <button title="规则"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg></button>
+    <button title="测试实验室"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 2v7.5L4.5 20a2 2 0 0 0 1.8 3h11.4a2 2 0 0 0 1.8-3L14 9.5V2"/><path d="M8.5 2h7"/></svg></button>
+    <button title="设置"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>
+    <div class="spacer"></div>
+    <div class="live" title="实时连接"></div>
+  </aside>
+
+  <aside class="list">
+    <div class="list-head">
+      <h1>工作上下文</h1>
+      <input class="search" placeholder="搜索 session / Agent / 模型" value="deploy" >
+      <div class="chips">
+        <span class="chip on">协议：全部 ▾</span>
+        <span class="chip on">风险：high ▾</span>
+        <span class="chip">能力：publish <i class="x">✕</i></span>
+        <span class="chip">时间：24h <i class="x">✕</i></span>
+      </div>
+    </div>
+    <div class="sessions" id="sessions"></div>
+  </aside>
+
+  <main class="main">
+    <div class="topbar">
+      <span class="ttl" id="ttl">payment-api 部署排障</span>
+      <span class="sub" id="sub">claude_code · claude-sonnet-4 · 12 次请求</span>
+      <span class="spacer"></span>
+      <button class="btn">↗ 复制链接</button>
+      <button class="btn">⟳ Replay</button>
+    </div>
+    <div class="scroll" id="timeline"></div>
+  </main>
+</div>
+
+<script>
+const sessions = [
+  {id:'s1', title:'payment-api 部署排障', client:'claude_code', model:'claude-sonnet-4', count:12, risk:'high', time:'2 分钟前'},
+  {id:'s2', title:'数据迁移脚本评审', client:'openai_agent', model:'gpt-5', count:8, risk:'critical', time:'18 分钟前'},
+  {id:'s3', title:'周报生成', client:'claude_code', model:'claude-opus-4', count:4, risk:'low', time:'1 小时前'},
+  {id:'s4', title:'CI 流水线修复', client:'unknown', model:'gpt-4.1', count:15, risk:'medium', time:'3 小时前'},
+];
+
+const traces = [
+  { n:'#12', t:'14:32:08', state:'alert', align:'contradicted · 违背约束', risk:'high', user:'帮我看下为什么 payment-api 部署失败，注意：不要重新部署。',
+    tools:[{name:'Bash', cap:'execute', args:{command:'git push origin main --force'}, target:'git push origin main'}],
+    wf:[
+      {sn:'Rules', v:'RISKY', r:'ACTION_CONTRADICTS_USER_CONSTRAINT', cls:'done', more:'证据：用户明示"不要重新部署"，拟调用 git push --force，能力 execute 与禁项冲突。<br><span class="k">matched_rules</span>：无'},
+      {sn:'Fast LLM', v:'reject', r:'contradicted · high risk', cls:'done', more:'模型：fast-model-v1 · 214ms · in 1.2k / out 180<br><span class="k">error_code</span>：无'},
+      {sn:'Deep LLM', v:'reject', r:'contradicted · high risk', cls:'done', more:'模型：deep-model-v1 · 1.4s · in 1.2k / out 620<br>带思考复核后维持拒绝'},
+      {sn:'最终', v:'alert', r:'deep_llm', cls:'final danger', more:'action_alignment：contradicted'},
+    ],
+    ctx:[{tag:'user', t:'帮我看下为什么 payment-api 部署失败，注意：不要重新部署。'},{tag:'hist', t:'Bash(read_logs) · read · 只读'},{tag:'proposed', t:'Bash(git push --force) · execute · 拟调用'}]
+  },
+  { n:'#11', t:'14:28:44', state:'allow', align:'aligned · 对齐', risk:'low', user:'继续查看 payment-api 最近的错误日志。',
+    tools:[{name:'Bash', cap:'read', args:{command:'kubectl logs payment-api-7f8d9c --tail=200'}, target:'kubectl logs'}],
+    wf:[
+      {sn:'Rules', v:'SAFE', r:'ACTION_WITHIN_USER_SCOPE', cls:'done', more:'证据：用户要求查看日志，能力 read 在授权范围内。<br><span class="k">matched_rules</span>：无'},
+      {sn:'Fast LLM', v:'—', r:'未触发（规则短路）', cls:'skipped'},
+      {sn:'Deep LLM', v:'—', r:'未触发', cls:'skipped'},
+      {sn:'最终', v:'allow', r:'rules', cls:'final', more:'action_alignment：aligned'},
+    ],
+    ctx:[{tag:'user', t:'继续查看 payment-api 最近的错误日志。'},{tag:'proposed', t:'Bash(kubectl logs) · read · 拟调用'}]
+  },
+  { n:'#10', t:'14:21:03', state:'alert', align:'high_impact · 高影响', risk:'critical', user:'把修复直接推到生产并发布。',
+    tools:[{name:'deploy', cap:'publish', args:{environment:'production', service:'payment-api'}, target:'production/payment-api'}],
+    wf:[
+      {sn:'Rules', v:'ALWAYS_ALERT', r:'PUBLISH_ALWAYS_ALERT', cls:'done', more:'命中规则：<span class="k">r1:3</span> "任何 git push 都告警" · always_alert'},
+      {sn:'Fast LLM', v:'—', r:'规则短路', cls:'skipped'},
+      {sn:'Deep LLM', v:'—', r:'规则短路', cls:'skipped'},
+      {sn:'最终', v:'alert', r:'rules', cls:'final danger', more:'action_alignment：high_impact'},
+    ],
+    ctx:[{tag:'user', t:'把修复直接推到生产并发布。'},{tag:'proposed', t:'deploy(production) · publish · 拟调用'}]
+  },
+];
+
+function riskHtml(level){return `<span class="risk ${level}"><i></i>${level}</span>`}
+function capHtml(cap){return `<span class="cap ${cap}">${cap}</span>`}
+
+function renderSessions(){
+  document.getElementById('sessions').innerHTML = sessions.map(s=>`
+    <button class="s-row ${s.id==='s1'?'active':''}" data-id="${s.id}">
+      <div class="t">${s.title}<span class="badge">${s.client}</span></div>
+      <div class="m">${s.model}</div>
+      <div class="meta"><span>${s.count} 次请求</span><span>${s.time}</span><span class="risk-wrap">${riskHtml(s.risk)}</span></div>
+    </button>`).join('');
+}
+
+function renderTimeline(){
+  document.getElementById('timeline').innerHTML = traces.map((tr,i)=>`
+  <article class="card">
+    <div class="card-head">
+      <span class="n">${tr.n} · REQUEST ${'a1b2c3d'+i}</span>
+      <span class="state ${tr.state}">${tr.state}</span>
+      <span class="align">${tr.align}</span>
+      <time>${tr.t}</time>
+      ${riskHtml(tr.risk)}
+    </div>
+    <div class="card-body">
+      <div><div class="lbl">用户输入</div><div class="msg">${tr.user}</div><button class="history-btn">显示其余 3 条历史消息</button></div>
+      <div><div class="lbl">模型拟调用的工具</div>
+        ${tr.tools.map(t=>`<div class="tool"><div class="ic" style="background:#1d2742">›_</div><div style="min-width:0"><span class="nm">${t.name}</span>${capHtml(t.cap)}<div class="m" style="margin-top:3px">target：${t.target}</div><pre>${JSON.stringify(t.args,null,2)}</pre></div></div>`).join('')}
+      </div>
+      <div><div class="lbl">判定瀑布 · 点击节点查看详情</div><div class="wf">
+        ${tr.wf.map(w=>`<div class="stage ${w.cls}" onclick="this.classList.toggle('open')"><div class="sn">${w.sn}</div><div class="v">${w.v}</div><div class="r">${w.r}</div><div class="more">${w.more}</div></div>`).join('')}
+      </div></div>
+      <details><summary>审查上下文（分类器实际看到的内容）</summary><div class="ctx">
+        ${tr.ctx.map(e=>`<div class="ev"><span class="tag ${e.tag}">${e.tag==='user'?'用户':e.tag==='hist'?'历史调用':'本轮拟调用'}</span><span>${e.t}</span></div>`).join('')}
+      </div></details>
+      <details><summary>查看原始 Input / Output JSON</summary><pre style="background:#0b111d;border:1px solid var(--line);border-radius:6px;padding:10px;font:11px/1.5 ui-monospace,monospace;color:#aebbd2;white-space:pre-wrap">{
+  "model": "claude-sonnet-4",
+  "messages": [
+    {"role":"user","content":"${tr.user}"},
+    {"role":"assistant","content":[{"type":"tool_use","name":"${tr.tools[0].name}","input":${JSON.stringify(tr.tools[0].args)}}]}
+  ]
+}</pre></details>
+    </div>
+  </article>`).join('') + '<p class="footnote">← 这是一个可交互原型：点击判定节点看完整字段，展开"审查上下文"看判定依据。</p>';
+}
+renderSessions();
+renderTimeline();
+
+document.getElementById('sessions').addEventListener('click', e=>{
+  const btn = e.target.closest('.s-row'); if(!btn) return;
+  document.querySelectorAll('.s-row').forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+  const s = sessions.find(x=>x.id===btn.dataset.id);
+  document.getElementById('ttl').textContent = s.title;
+  document.getElementById('sub').textContent = `${s.client} · ${s.model} · ${s.count} 次请求`;
+});
+</script>
+</body>
+</html>

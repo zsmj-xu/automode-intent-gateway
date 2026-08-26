@@ -235,6 +235,40 @@ class ProxyIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(classification["action_alignment"], "contradicted")
         self.assertNotEqual(trace["declared_tool_count"], len(classification["proposed_actions"]))
 
+    async def test_conversation_fingerprint_groups_requests_without_session_header(self) -> None:
+        opener = {"model": "fp-test", "messages": [{"role": "user", "content": "帮我重构这个模块"}]}
+        continued = {"model": "fp-test", "messages": [
+            {"role": "user", "content": "帮我重构这个模块"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Edit", "input": {"file_path": "a.py"}}]},
+            {"role": "user", "content": "继续"},
+        ]}
+        for payload in (opener, continued):
+            async with self.client.post(
+                self.gateway.make_url("/v1/chat/completions"), json=payload,
+            ) as response:
+                self.assertEqual(response.status, 200)
+                await response.read()
+        await asyncio.sleep(0.05)
+        async with self.client.get(self.gateway.make_url("/api/sessions")) as response:
+            sessions = (await response.json())["data"]
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual(sessions[0]["call_count"], 2)
+        self.assertIn("write", sessions[0]["authorization"]["capabilities"])
+        self.assertEqual(sessions[0]["external_session_id"], None)
+
+    async def test_conversation_fingerprint_splits_different_openers(self) -> None:
+        for content in ("帮我重构这个模块", "写一个部署脚本"):
+            payload = {"model": "fp-test", "messages": [{"role": "user", "content": content}]}
+            async with self.client.post(
+                self.gateway.make_url("/v1/chat/completions"), json=payload,
+            ) as response:
+                self.assertEqual(response.status, 200)
+                await response.read()
+        await asyncio.sleep(0.05)
+        async with self.client.get(self.gateway.make_url("/api/sessions")) as response:
+            sessions = (await response.json())["data"]
+        self.assertEqual(len(sessions), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -65,6 +65,57 @@ test('playground exposes all protocols, raw mode, history and rules-only mode', 
   expect(screen.getByText(/不会执行真实工具/)).toBeInTheDocument()
 })
 
+const jsonOk = (value: unknown) => ({ ok: true, status: 200, json: async () => value, text: async () => '' })
+const sseStub = () => ({ ok: true, status: 200, json: async () => ({}), text: async () => '' })
+
+test('sessions page renders the audit timeline with full decision report and review context', async () => {
+  const session = { id: 's1', external_session_id: 'ctx-1', client_type: 'claude_code', models: ['m'], call_count: 1, max_risk: 'high', protocols: [], tool_call_count: 1, allow_count: 0, alert_count: 1, created_at: '', last_seen_at: '' }
+  const detail = {
+    session,
+    traces: [{
+      trace_id: 't1', created_at: '', model: 'm', protocol: 'openai_chat_completions', method: 'POST', path: '/v1',
+      latest_user_text: '不要 push', response_status: 200, latency_ms: 5, response_capture_complete: true, session_evidence: {},
+      request_body: {}, response_body: null,
+      tool_actions: [{ tool_name: 'Bash', arguments: { command: 'git push' }, capability: 'publish', target: 'git push', side_effect: null, risk: 'high' }],
+      classification: { final_decision: 'alert', final_stage: 'rules', risk: 'high', action_alignment: 'contradicted', reason_code: 'USER_CONSTRAINT', reason: '禁止 push', review_transcript: [{ type: 'user', text: '不要 push' }], stages: [{ stage: 'rules', status: 'completed', verdict: 'ALWAYS_ALERT', risk: 'high', reason_code: 'USER_CONSTRAINT', reason: 'x', latency_ms: 1 }] },
+      alerts: [{ id: 'a1', trace_id: 't1', classification_run_id: 'r1', session_record_id: 's1', created_at: '', severity: 'high', status: 'open', reason_code: 'USER_CONSTRAINT', title: 'HIGH: Bash', reason: '禁止 push', evidence: ['不要 push'], actions: [{ name: 'Bash' }], matched_rules: [], final_stage: 'rules', acknowledged_at: null, operator_note: '', feedback: null }],
+    }],
+  }
+  vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
+    const path = String(input)
+    if (path === '/api/dashboard') return jsonOk({ ...dashboardPayload, trace_count: 1 })
+    if (path.startsWith('/api/sessions/') && path.endsWith('/detail')) return jsonOk(detail)
+    if (path.startsWith('/api/sessions')) return jsonOk({ data: [session] })
+    if (path === '/api/events') return sseStub()
+    return jsonOk({ data: [] })
+  }))
+  render(<App />)
+  fireEvent.click(screen.getByRole('button', { name: '会话' }))
+  expect(await screen.findByText('会话审计')).toBeInTheDocument()
+  expect(await screen.findByText('审查上下文（分类器实际看到的内容）')).toBeInTheDocument()
+  expect(await screen.findByText('拟调用工具')).toBeInTheDocument()
+  expect(screen.getAllByText('不要 push').length).toBeGreaterThan(0)
+})
+
+test('alerts page submits human feedback for triage', async () => {
+  const alert = { id: 'a1', trace_id: 't1', classification_run_id: 'r1', session_record_id: 's1', created_at: '', severity: 'high', status: 'open', reason_code: 'USER_CONSTRAINT', title: 'HIGH: Bash', reason: '禁止 push', evidence: ['不要 push'], actions: [{ name: 'Bash' }], matched_rules: [], final_stage: 'rules', acknowledged_at: null, operator_note: '', feedback: null }
+  const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+    const path = String(input)
+    if (path === '/api/dashboard') return jsonOk(dashboardPayload)
+    if (path.startsWith('/api/alerts/') && (init?.method === 'POST')) return jsonOk({ ...alert, status: 'false_positive' })
+    if (path.startsWith('/api/alerts')) return jsonOk({ data: [alert] })
+    if (path === '/api/events') return sseStub()
+    return jsonOk({ data: [] })
+  })
+  vi.stubGlobal('fetch', fetchMock)
+  render(<App />)
+  fireEvent.click(screen.getByRole('button', { name: '告警' }))
+  expect(await screen.findByText('告警中心')).toBeInTheDocument()
+  expect(await screen.findByText('人工反馈')).toBeInTheDocument()
+  fireEvent.click(screen.getByRole('button', { name: '误报' }))
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/alerts/a1/feedback', expect.objectContaining({ method: 'POST' })))
+})
+
 test('shows the auth gate on 401 and unlocks after entering the admin token', async () => {
   vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
     const path = String(input)
