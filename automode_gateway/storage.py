@@ -13,10 +13,11 @@ from pathlib import Path
 from typing import Any
 
 from .classifier import authorization_signals
-from .dlp import redact_payload, scan_payload
+from .dlp import BUILTIN_DETECTORS, redact_payload, scan_payload
 from .evidence import decrypt as decrypt_evidence
 from .evidence import encrypt as encrypt_evidence
 from .evidence import load_key
+from .llm_classifier import DEFAULT_PROMPTS
 from .normalizer import extract_messages, normalize
 from .review_context import build_review_context, normalize_tool_call
 from .session_fingerprint import conversation_fingerprint as fingerprint_messages
@@ -810,6 +811,7 @@ class TraceStore:
         decision: str | None = None,
         capability: str | None = None,
         since: str | None = None,
+        category: str | None = None,
     ) -> list[dict[str, Any]]:
         with self._connect() as connection:
             rows = connection.execute("SELECT * FROM sessions ORDER BY last_seen_at DESC LIMIT 500").fetchall()
@@ -820,6 +822,68 @@ class TraceStore:
                        WHERE a.capability=?""", (capability,)
                 )}
                 result = [row for row in result if row["id"] in allowed_ids]
+
+            if result:
+                session_ids = [row["id"] for row in result]
+                placeholders = ", ".join("?" for _ in session_ids)
+                dlp_info_rows = connection.execute(
+                    f"""SELECT t.session_record_id, r.data_findings_json, r.policy_decision,
+                               r.review_object, a.id AS alert_id
+                        FROM traces t
+                        LEFT JOIN classification_runs r ON r.trace_id = t.id
+                        LEFT JOIN alerts a ON a.trace_id = t.id
+                        WHERE t.session_record_id IN ({placeholders})""",
+                    session_ids,
+                ).fetchall()
+
+                session_dlp_map: dict[str, dict[str, Any]] = {
+                    sid: {"findings_count": 0, "categories": set(), "has_dlp_alert": False, "has_intent_alert": False}
+                    for sid in session_ids
+                }
+                for d_row in dlp_info_rows:
+                    sid = d_row[0]
+                    if not sid or sid not in session_dlp_map:
+                        continue
+                    findings_raw = d_row[1]
+                    if findings_raw:
+                        try:
+                            findings = json.loads(findings_raw)
+                            if isinstance(findings, list) and findings:
+                                session_dlp_map[sid]["findings_count"] += len(findings)
+                                for f in findings:
+                                    cat = f.get("category")
+                                    if cat:
+                                        session_dlp_map[sid]["categories"].add(str(cat))
+                        except Exception:
+                            pass
+                    review_object = d_row[3]
+                    has_alert = bool(d_row[4])
+                    if review_object == "outbound_request" and d_row[2] == "alert":
+                        session_dlp_map[sid]["has_dlp_alert"] = True
+                    elif has_alert:
+                        session_dlp_map[sid]["has_intent_alert"] = True
+
+                tool_risks = {sid: "low" for sid in session_ids}
+                for action_row in connection.execute(
+                    f"""SELECT t.session_record_id, a.risk FROM traces t
+                        JOIN tool_actions a ON a.trace_id=t.id
+                        WHERE t.session_record_id IN ({placeholders})""",
+                    session_ids,
+                ).fetchall():
+                    sid, risk_value = action_row
+                    if sid in tool_risks and risk_value in _RISK_ORDER:
+                        if _RISK_ORDER.index(risk_value) > _RISK_ORDER.index(tool_risks[sid]):
+                            tool_risks[sid] = risk_value
+
+                for row in result:
+                    sid = row["id"]
+                    meta = session_dlp_map.get(sid, {})
+                    row["dlp_findings_count"] = meta.get("findings_count", 0)
+                    row["dlp_categories"] = sorted(meta.get("categories", set()))
+                    row["has_dlp_alert"] = meta.get("has_dlp_alert", False)
+                    row["has_intent_alert"] = meta.get("has_intent_alert", False)
+                    row["intent_risk"] = tool_risks.get(sid, "low")
+
         if protocol:
             result = [row for row in result if protocol in row["protocols"]]
         if model:
@@ -832,6 +896,10 @@ class TraceStore:
             result = [row for row in result if row["alert_count"] > 0]
         if since:
             result = [row for row in result if row["last_seen_at"] >= since]
+        if category == "dlp":
+            result = [row for row in result if row.get("dlp_findings_count", 0) > 0 or row.get("has_dlp_alert")]
+        elif category == "intent":
+            result = [row for row in result if row.get("has_intent_alert") or (row.get("intent_risk") in {"medium", "high", "critical"})]
         return result[:min(max(limit, 1), 500)]
 
     def session(self, session_id: str) -> dict[str, Any] | None:
@@ -1064,13 +1132,16 @@ class TraceStore:
         result["stages"] = [_json_row(row, ("matched_rule_ids_json", "matched_rule_versions_json", "evidence_json")) for row in stages]
         return result
 
-    def alerts(self, limit: int = 100, status: str | None = None) -> list[dict[str, Any]]:
+    def alerts(self, limit: int = 100, status: str | None = None, alert_type: str | None = None) -> list[dict[str, Any]]:
         with self._connect() as connection:
             if status:
                 rows = connection.execute("SELECT * FROM alerts WHERE status=? ORDER BY created_at DESC LIMIT ?", (status, min(limit, 500))).fetchall()
             else:
                 rows = connection.execute("SELECT * FROM alerts ORDER BY created_at DESC LIMIT ?", (min(limit, 500),)).fetchall()
-        return [_alert_row(row) for row in rows]
+        result = [_alert_row(row) for row in rows]
+        if alert_type:
+            result = [row for row in result if row.get("alert_type") == alert_type]
+        return result
 
     def alert(self, alert_id: str) -> dict[str, Any] | None:
         with self._connect() as connection:
@@ -1171,6 +1242,78 @@ class TraceStore:
                 connection.execute("INSERT INTO settings VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at", (key, json.dumps(value), _now()))
             _audit(connection, "settings.updated", "settings", None, {"keys": sorted(values), "secret_values_stored": False})
         return self.settings()
+
+    # Prompts management --------------------------------------------------------
+    def get_prompts(self) -> dict[str, str]:
+        with self._connect() as connection:
+            row = connection.execute("SELECT value_json FROM settings WHERE key='prompts'").fetchone()
+        custom = json.loads(row[0]) if row and row[0] else {}
+        return {**DEFAULT_PROMPTS, **custom}
+
+    def get_default_prompts(self) -> dict[str, str]:
+        return dict(DEFAULT_PROMPTS)
+
+    def set_prompt(self, name: str, content: str) -> dict[str, str]:
+        if name not in DEFAULT_PROMPTS:
+            raise ValueError(f"unknown prompt name: {name}")
+        with self._connect() as connection:
+            row = connection.execute("SELECT value_json FROM settings WHERE key='prompts'").fetchone()
+            current = json.loads(row[0]) if row and row[0] else {}
+            current[name] = content
+            connection.execute(
+                "INSERT INTO settings (key, value_json, updated_at) VALUES ('prompts', ?, ?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at",
+                (json.dumps(current, ensure_ascii=False), _now()),
+            )
+            _audit(connection, "prompt.updated", "prompt", name, {"length": len(content)})
+        return self.get_prompts()
+
+    def update_prompts(self, prompts: dict[str, str]) -> dict[str, str]:
+        for name in prompts:
+            if name not in DEFAULT_PROMPTS:
+                raise ValueError(f"unknown prompt name: {name}")
+        with self._connect() as connection:
+            row = connection.execute("SELECT value_json FROM settings WHERE key='prompts'").fetchone()
+            current = json.loads(row[0]) if row and row[0] else {}
+            current.update(prompts)
+            connection.execute(
+                "INSERT INTO settings (key, value_json, updated_at) VALUES ('prompts', ?, ?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at",
+                (json.dumps(current, ensure_ascii=False), _now()),
+            )
+            _audit(connection, "prompts.updated", "prompt", "all", {"keys": list(prompts.keys())})
+        return self.get_prompts()
+
+    def reset_prompts(self, name: str | None = None) -> dict[str, str]:
+        with self._connect() as connection:
+            if name is None:
+                connection.execute("DELETE FROM settings WHERE key='prompts'")
+                _audit(connection, "prompts.reset", "prompt", "all", {})
+            else:
+                if name not in DEFAULT_PROMPTS:
+                    raise ValueError(f"unknown prompt name: {name}")
+                row = connection.execute("SELECT value_json FROM settings WHERE key='prompts'").fetchone()
+                if row and row[0]:
+                    current = json.loads(row[0])
+                    current.pop(name, None)
+                    connection.execute(
+                        "INSERT INTO settings (key, value_json, updated_at) VALUES ('prompts', ?, ?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at",
+                        (json.dumps(current, ensure_ascii=False), _now()),
+                    )
+                _audit(connection, "prompt.reset", "prompt", name, {})
+        return self.get_prompts()
+
+    # Detectors management ------------------------------------------------------
+    def get_detectors(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": item["id"],
+                "name": item["name"],
+                "category": item["category"],
+                "description": item["description"],
+                "pattern": item["pattern"],
+                "enabled": True,
+            }
+            for item in BUILTIN_DETECTORS
+        ]
 
     def record_test_run(
         self,
@@ -1576,7 +1719,16 @@ def _rule_row(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def _alert_row(row: sqlite3.Row) -> dict[str, Any]:
-    return _json_row(row, ("evidence_json", "actions_json", "matched_rules_json", "data_findings_json", "destination_json"))
+    value = _json_row(row, ("evidence_json", "actions_json", "matched_rules_json", "data_findings_json", "destination_json"))
+    findings = value.get("data_findings") or []
+    reason_code = str(value.get("reason_code") or "")
+    is_dlp = bool(findings or "DLP" in reason_code or "SENSITIVE" in reason_code)
+    value["alert_type"] = "dlp" if is_dlp else "intent_action"
+    value["data_categories"] = sorted({str(f.get("category")) for f in findings if isinstance(f, dict) and f.get("category")})
+    destination = value.get("destination") or {}
+    value["destination_name"] = destination.get("name") or destination.get("model") or "未知模型"
+    value["destination_trust"] = destination.get("trust", "external")
+    return value
 
 
 def _tool_action_row(row: sqlite3.Row) -> dict[str, Any]:

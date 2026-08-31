@@ -154,6 +154,7 @@ class AdminApiTests(unittest.IsolatedAsyncioTestCase):
         )
         result = {
             "final_decision": "alert", "final_stage": "deep_llm", "risk": "high",
+            "review_object": "tool_action",
             "action_alignment": "contradicted", "reason_code": "USER_CONSTRAINT", "reason": "用户明确禁止 push",
             "authorization_evidence": ["不要 push"],
             "proposed_actions": [{"name": "Bash", "arguments": {"command": "git push"}, "capability": "publish", "target": "git push", "side_effect": "external_state_change", "risk": "high"}],
@@ -230,6 +231,29 @@ class AdminApiTests(unittest.IsolatedAsyncioTestCase):
             lines = [await asyncio.wait_for(stream.content.readline(), 1) for _ in range(3)]
             self.assertTrue(any(line.startswith(b"event: alert.created") for line in lines))
 
+    async def test_session_intent_risk_excludes_dlp_severity(self):
+        store = self.app[TRACE_STORE_KEY]
+        trace_id = store.create(
+            protocol="openai_chat_completions", method="POST", path="/v1/chat/completions",
+            payload={"model": "m", "messages": [{"role": "user", "content": "password=hunter2"}]},
+            headers={}, session_id="dlp-only-risk", latest_user_text="password=hunter2", declared_tool_count=1,
+        )
+        dlp_result = {
+            "final_decision": "alert", "final_stage": "rules", "risk": "critical",
+            "review_object": "outbound_request", "action_alignment": "normal",
+            "reason_code": "SENSITIVE_DATA_TO_EXTERNAL", "reason": "Sensitive outbound data.",
+            "authorization_evidence": [], "proposed_actions": [{"name": "read_file", "arguments": {}, "capability": "read", "target": "docs", "side_effect": "none", "risk": "low"}],
+            "matched_rules": ["builtin-sensitive-external"], "review_transcript": [], "total_latency_ms": 1,
+            "data_findings": [{"category": "credential", "path": "$.messages[0].content", "confidence": "high", "fingerprint": "x", "snippet": "[REDACTED:CREDENTIAL]", "detector": "secret_assignment"}],
+            "destination": {"trust": "external"}, "policy_decision": "alert",
+            "stages": [{"stage": "rules", "status": "completed", "verdict": "ALWAYS_ALERT", "risk": "critical", "reason_code": "SENSITIVE_DATA_TO_EXTERNAL", "reason": "Sensitive outbound data.", "latency_ms": 1, "action_alignment": "normal", "matched_rule_ids": [], "matched_rule_versions": []}],
+        }
+        store.save_pipeline(trace_id, dlp_result)
+        session = next(item for item in store.sessions() if item["external_session_id"] == "dlp-only-risk")
+        self.assertEqual(session["max_risk"], "critical")
+        self.assertEqual(session["intent_risk"], "low")
+        self.assertFalse(session["has_intent_alert"])
+
     async def test_built_console_is_served(self):
         async with self.client.get(self.server.make_url("/")) as response:
             text = await response.text()
@@ -257,6 +281,35 @@ class AdminApiTests(unittest.IsolatedAsyncioTestCase):
                 os.environ.pop("AUTOMODE_WEB_DIST", None)
         self.assertEqual(response.status, 200)
         self.assertIn("Custom Console", text)
+
+    async def test_prompts_crud_and_reset(self):
+        async with self.client.get(self.server.make_url("/api/prompts")) as response:
+            self.assertEqual(response.status, 200)
+            data = await response.json()
+            self.assertIn("outbound_dlp", data["data"])
+            self.assertIn("outbound_dlp", data["defaults"])
+
+        new_prompt = "Custom DLP prompt for testing"
+        async with self.client.patch(self.server.make_url("/api/prompts"), json={"prompts": {"outbound_dlp": new_prompt}}) as response:
+            self.assertEqual(response.status, 200)
+            data = await response.json()
+            self.assertEqual(data["data"]["outbound_dlp"], new_prompt)
+
+        async with self.client.post(self.server.make_url("/api/prompts/reset"), json={"name": "outbound_dlp"}) as response:
+            self.assertEqual(response.status, 200)
+            data = await response.json()
+            self.assertEqual(data["data"]["outbound_dlp"], data["defaults"]["outbound_dlp"])
+
+    async def test_detectors_are_listed_as_always_enabled(self):
+        async with self.client.get(self.server.make_url("/api/detectors")) as response:
+            self.assertEqual(response.status, 200)
+            data = await response.json()
+            self.assertTrue(len(data["data"]) > 0)
+            pk = next(d for d in data["data"] if d["id"] == "private_key")
+            self.assertTrue(pk["enabled"])
+
+        async with self.client.patch(self.server.make_url("/api/detectors/private_key"), json={"enabled": False}) as response:
+            self.assertEqual(response.status, 405)
 
 
 class AdminAuthTests(unittest.IsolatedAsyncioTestCase):

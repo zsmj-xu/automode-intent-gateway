@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Activity, AlertTriangle, ChevronRight, RefreshCw, Search, ShieldAlert, SlidersHorizontal, User, X } from 'lucide-react'
+import { Activity, AlertTriangle, ChevronRight, RefreshCw, Search, ShieldAlert, ShieldCheck, SlidersHorizontal, User, X } from 'lucide-react'
 import type { Alert, Json, Session, SessionDetail, TraceDetail } from '../types'
 import { useLoad } from '../lib/hooks'
 import { formatTime, sessionTitle, truncate } from '../lib/format'
@@ -22,6 +22,7 @@ export function Sessions({ refresh }: { refresh: number }) {
   const [filters, setFilters] = useState({
     since: initial.get('since') || '', protocol: initial.get('protocol') || '', model: initial.get('model') || '',
     risk: initial.get('risk') || '', decision: initial.get('decision') || '', capability: initial.get('capability') || '',
+    category: initial.get('category') || '',
   })
   const [search, setSearch] = useState(initial.get('q') || '')
   const [showFilters, setShowFilters] = useState(false)
@@ -70,7 +71,7 @@ export function Sessions({ refresh }: { refresh: number }) {
   return (
     <div className="sessions-page">
       <section className="session-intro">
-        <div><p className="eyebrow">SHADOW DLP TIMELINE</p><h2>出站请求审计</h2><p>按人的用途、敏感数据、模型目标和策略结论调查每次调用；Observe 模式不阻断。</p></div>
+        <div><p className="eyebrow">SHADOW DLP & INTENT TIMELINE</p><h2>出站请求审计</h2><p>双维度监控：① 出站数据合规 (DLP)；② 行为意图安全 (Intent)；Observe 模式旁路记录与告警。</p></div>
         <div className="session-count">
           <strong>{visibleRows.length}</strong><span>个匹配上下文</span>
           <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
@@ -91,7 +92,15 @@ export function Sessions({ refresh }: { refresh: number }) {
       </section>
       <div className="master-detail">
         <section className="panel list-panel">
-          <PanelTitle title="工作上下文" subtitle="按会话聚合，不按 API Key 聚合" />
+          <PanelTitle title="工作上下文" subtitle="按会话聚合，双维度展示数据合规与意图安全" />
+
+          {/* 快速分类过滤器 */}
+          <div className="alert-filter-segmented" style={{ marginBottom: '10px' }}>
+            <button className={filters.category === '' ? 'active' : ''} onClick={() => update('category', '')}>全部上下文</button>
+            <button className={filters.category === 'dlp' ? 'active' : ''} onClick={() => update('category', 'dlp')}>🛡️ 敏感数据出站</button>
+            <button className={filters.category === 'intent' ? 'active' : ''} onClick={() => update('category', 'intent')}>⚡ 意图行为风险</button>
+          </div>
+
           <div className="session-toolbar">
             <label className="session-search"><Search size={15} /><input aria-label="搜索上下文" placeholder="搜索 session / Agent / 模型" value={search} onChange={event => setSearch(event.target.value)} /></label>
             <button className="icon-button" aria-label="更多筛选" aria-expanded={showFilters} onClick={() => setShowFilters(value => !value)}><SlidersHorizontal size={16} /></button>
@@ -101,7 +110,7 @@ export function Sessions({ refresh }: { refresh: number }) {
               {activeFilters.map(([key, value]) => (
                 <span className="chip" key={key}>{key}: {value}<button onClick={() => update(key as keyof typeof filters, '')} aria-label={`清除 ${key} 筛选`}><X size={12} /></button></span>
               ))}
-              <button className="text-button" onClick={() => setFilters({ since: '', protocol: '', model: '', risk: '', decision: '', capability: '' })}>清空</button>
+              <button className="text-button" onClick={() => setFilters({ since: '', protocol: '', model: '', risk: '', decision: '', capability: '', category: '' })}>清空</button>
             </div>
           )}
           {showFilters && (
@@ -118,6 +127,9 @@ export function Sessions({ refresh }: { refresh: number }) {
             <div className="session-list">
               {visibleRows.map(row => {
                 const hasAlert = row.alert_count > 0
+                const hasDlpRisk = Boolean((row.dlp_findings_count && row.dlp_findings_count > 0) || row.has_dlp_alert)
+                const hasIntentRisk = Boolean(row.has_intent_alert || (row.intent_risk && row.intent_risk !== 'low'))
+
                 return (
                   <button
                     key={row.id}
@@ -133,6 +145,33 @@ export function Sessions({ refresh }: { refresh: number }) {
                         {hasAlert && <span className="session-alert-tag">告警</span>}
                       </div>
                       <Risk level={row.max_risk} />
+                    </div>
+
+                    {/* 双维度核心指标标签 */}
+                    <div className="session-dual-tags">
+                      {hasDlpRisk ? (
+                        <span className="dual-tag dlp-warn" title={`敏感数据出站: ${row.dlp_categories?.join(', ') || '已告警'}`}>
+                          <ShieldAlert size={12} />
+                          <span>DLP: {row.dlp_categories?.length ? row.dlp_categories.join('/') : `${row.dlp_findings_count || 1}项敏感`}</span>
+                        </span>
+                      ) : (
+                        <span className="dual-tag dlp-safe">
+                          <ShieldCheck size={12} />
+                          <span>DLP: 无敏感外发</span>
+                        </span>
+                      )}
+
+                      {hasIntentRisk ? (
+                        <span className="dual-tag intent-warn" title="存在高危或越权行为意图">
+                          <AlertTriangle size={12} />
+                          <span>意图: {row.intent_risk ? `${row.intent_risk.toUpperCase()}风险` : '动作存疑'}</span>
+                        </span>
+                      ) : (
+                        <span className="dual-tag intent-safe">
+                          <Activity size={12} />
+                          <span>意图: 正常</span>
+                        </span>
+                      )}
                     </div>
 
                     <div className="session-row-meta">
@@ -208,6 +247,40 @@ function SessionDetail({ id, refresh, onClose }: { id: string; refresh: number; 
           <button className="icon-button" aria-label="关闭详情" onClick={onClose}><X /></button>
         </div>
       </div>
+
+      {/* 双维度总体态势总结卡片 */}
+      <div className="session-dual-summary-grid">
+        <div className={`summary-box dlp ${session.dlp_findings_count ? 'warn' : 'safe'}`}>
+          <div className="summary-box-head">
+            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+              <ShieldAlert size={16} />
+              <b>出站数据合规 (DLP)</b>
+            </div>
+            <span className={`summary-status-pill ${session.dlp_findings_count ? 'alert' : 'safe'}`}>
+              {session.dlp_findings_count ? `${session.dlp_findings_count} 项敏感发现` : '未发现敏感数据'}
+            </span>
+          </div>
+          <div className="summary-box-body">
+            <span>敏感数据类型: <b>{session.dlp_categories?.length ? session.dlp_categories.join(', ') : '无'}</b></span>
+            <span>外发合规判定: <b>{session.has_dlp_alert ? '命中外发策略告警 ⚠️' : '合规放行'}</b></span>
+          </div>
+        </div>
+
+        <div className={`summary-box intent ${session.has_intent_alert || (session.intent_risk && session.intent_risk !== 'low') ? 'warn' : 'safe'}`}>
+          <div className="summary-box-head">
+            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+              <Activity size={16} />
+              <b>行为意图安全 (Intent)</b>
+            </div>
+            <Risk level={session.intent_risk || 'low'} />
+          </div>
+          <div className="summary-box-body">
+            <span>模型动作/工具调用: <b>{session.tool_call_count || 0} 次</b></span>
+            <span>意图风险状态: <b>{session.has_intent_alert ? '存在越权或高危动作告警 ⚠️' : '意图正常对齐'}</b></span>
+          </div>
+        </div>
+      </div>
+
       {session.authorization && (session.authorization.capabilities?.length || session.authorization.forbidden_capabilities?.length || session.authorization.statements?.length) ? (
         <SessionBaseline authorization={session.authorization} />
       ) : null}

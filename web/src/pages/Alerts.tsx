@@ -15,6 +15,7 @@ const FEEDBACKS = [
 
 export function Alerts({ refresh, onOpenTrace }: { refresh: number; onOpenTrace?: (sessionId: string | null, traceId: string) => void }) {
   const [statusFilter, setStatusFilter] = useState<string>('')
+  const [typeFilter, setTypeFilter] = useState<string>('')
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [localRefresh, setLocalRefresh] = useState(0)
   const [rawEvidence, setRawEvidence] = useState<unknown>(null)
@@ -24,7 +25,10 @@ export function Alerts({ refresh, onOpenTrace }: { refresh: number; onOpenTrace?
   const [noteSaving, setNoteSaving] = useState(false)
   const [noteStatus, setNoteStatus] = useState('')
 
-  const { data, error } = useLoad<{ data: Alert[] }>(`/api/alerts?limit=200&status=${statusFilter}&v=${refresh + localRefresh}`, refresh + localRefresh)
+  const { data, error } = useLoad<{ data: Alert[] }>(
+    `/api/alerts?limit=200&status=${statusFilter}&alert_type=${typeFilter}&v=${refresh + localRefresh}`,
+    refresh + localRefresh
+  )
   const rows = data?.data || []
   const selected = rows.find(row => row.id === selectedId) || rows[0] || null
 
@@ -76,7 +80,7 @@ export function Alerts({ refresh, onOpenTrace }: { refresh: number; onOpenTrace?
   }
 
   const STATUS_LABELS: Record<string, string> = {
-    '': '全部',
+    '': '全部状态',
     open: '开放',
     acknowledged: '已确认',
     false_positive: '误报项',
@@ -88,27 +92,50 @@ export function Alerts({ refresh, onOpenTrace }: { refresh: number; onOpenTrace?
       <section className="panel list-panel">
         <PanelTitle
           title="告警中心"
-          subtitle="观察模式只记录和告警，不阻断 Agent"
+          subtitle="双维度审计：数据出站违规 vs 动作意图违规；Observe 模式不阻断 Agent"
         />
+
+        {/* 告警类别筛选 */}
+        <div className="alert-filter-segmented" style={{ marginBottom: '8px' }}>
+          <button className={typeFilter === '' ? 'active' : ''} onClick={() => setTypeFilter('')}>全部类型</button>
+          <button className={typeFilter === 'dlp' ? 'active' : ''} onClick={() => setTypeFilter('dlp')}>🛡️ 出站数据违规 (DLP)</button>
+          <button className={typeFilter === 'intent_action' ? 'active' : ''} onClick={() => setTypeFilter('intent_action')}>⚡ 行为意图违规</button>
+        </div>
+
+        {/* 处置状态筛选 */}
         <div className="alert-filter-segmented">
-          <button className={statusFilter === '' ? 'active' : ''} onClick={() => setStatusFilter('')}>全部</button>
           {STATUSES.map(status => (
             <button key={status} className={statusFilter === status ? 'active' : ''} onClick={() => setStatusFilter(status)}>
               {STATUS_LABELS[status] || status}
             </button>
           ))}
+          {statusFilter !== '' && (
+            <button className="text-button" onClick={() => setStatusFilter('')}>清空状态</button>
+          )}
         </div>
+
         {rows.length ? (
           <div className="alert-list">
             {rows.map(row => {
               // 移除标题中重复的 severity 前缀
               const cleanTitle = row.title.replace(/^(HIGH|MEDIUM|LOW|CRITICAL):\s*/i, '')
+              const isDlp = row.alert_type === 'dlp' || (row.data_findings && row.data_findings.length > 0)
               return (
                 <button key={row.id} className={selected?.id === row.id ? 'alert-row selected' : 'alert-row'} onClick={() => setSelectedId(row.id)}>
                   <Risk level={row.severity} />
                   <div className="alert-row-body">
-                    <b title={row.title}>{cleanTitle}</b>
-                    <code>{row.reason_code}</code>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
+                      <span className={`alert-type-tag ${isDlp ? 'dlp' : 'intent'}`}>
+                        {isDlp ? '🛡️ 数据出站' : '⚡ 动作意图'}
+                      </span>
+                      <b title={row.title}>{cleanTitle}</b>
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
+                      <code>{row.reason_code}</code>
+                      {row.data_categories?.map(cat => (
+                        <span key={cat} className="cat-chip">{cat}</span>
+                      ))}
+                    </div>
                     <span>{formatTime(row.created_at)}</span>
                   </div>
                   <StatusPill status={row.status} />
@@ -116,14 +143,19 @@ export function Alerts({ refresh, onOpenTrace }: { refresh: number; onOpenTrace?
               )
             })}
           </div>
-        ) : <Empty text="当前没有告警" />}
+        ) : <Empty text="当前筛选条件下没有告警" />}
       </section>
 
       {selected ? (
         <section className="panel detail-panel">
           <div className="panel-heading">
             <div>
-              <p className="eyebrow">ALERT DETAIL</p>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
+                <span className={`alert-type-tag ${selected.alert_type === 'dlp' || (selected.data_findings && selected.data_findings.length > 0) ? 'dlp' : 'intent'}`}>
+                  {selected.alert_type === 'dlp' || (selected.data_findings && selected.data_findings.length > 0) ? '🛡️ 出站数据违规告警' : '⚡ 行为意图违规告警'}
+                </span>
+                <p className="eyebrow" style={{ margin: 0 }}>ALERT DETAIL</p>
+              </div>
               <h2>{selected.title}</h2>
               <p className="detail-subtitle">{selected.reason_code} · {formatTime(selected.created_at)}</p>
             </div>
@@ -139,29 +171,35 @@ export function Alerts({ refresh, onOpenTrace }: { refresh: number; onOpenTrace?
               {selected.destination && <div><span>模型目标</span><b>{selected.destination.name} · <StatusPill status={selected.destination.trust || 'external'} /></b></div>}
             </div>
 
-            {!!selected.data_findings?.length && (
-              <div className="evidence">
-                <b>敏感数据发现</b>
-                {selected.data_findings.map((finding, index) => (
+            {/* 1. 出站数据敏感发现分析（DLP 维度） */}
+            {(!!selected.data_findings?.length || selected.alert_type === 'dlp') && (
+              <div className="evidence" style={{ borderLeft: '3px solid var(--danger)', paddingLeft: '12px' }}>
+                <b>🛡️ 出站数据违规发现 (DLP)</b>
+                {selected.data_findings?.map((finding, index) => (
                   <span key={`${finding.path}-${index}`}>
                     <code>{finding.category}</code> {finding.path} · {finding.detector}
                     {finding.snippet && <small style={{ display: 'block', color: '#f1c879', marginTop: '2px' }}>样例: {finding.snippet}</small>}
                   </span>
                 ))}
+                {selected.evidence?.length > 0 && (
+                  <div style={{ marginTop: '8px' }}>
+                    <small style={{ color: 'var(--muted)' }}>脱敏证据:</small>
+                    {selected.evidence.map(line => <span key={line}>{line}</span>)}
+                  </div>
+                )}
               </div>
             )}
 
-            {selected.evidence?.length > 0 && (
-              <div className="evidence">
-                <b>脱敏 DLP 证据</b>
-                {selected.evidence.map(line => <span key={line}>{line}</span>)}
-              </div>
-            )}
-
-            {selected.actions?.length > 0 && (
-              <div className="evidence">
-                <b>模型动作旁证</b>
-                {selected.actions.map((action, index) => <span key={index}>{action.name}{action.target ? ` · ${action.target}` : ''}</span>)}
+            {/* 2. 行为意图与动作判定（Intent 维度） */}
+            {(selected.actions?.length > 0 || selected.alert_type === 'intent_action') && (
+              <div className="evidence" style={{ borderLeft: '3px solid var(--warn)', paddingLeft: '12px' }}>
+                <b>⚡ 行为意图与动作旁证 (Intent)</b>
+                {selected.actions?.map((action, index) => (
+                  <span key={index}>
+                    <code>{action.name}</code> {action.target ? ` · 目标: ${action.target}` : ''}
+                    {action.capability && ` [${action.capability}]`}
+                  </span>
+                ))}
               </div>
             )}
 

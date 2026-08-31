@@ -1,16 +1,23 @@
 import { useState } from 'react'
-import { Beaker, ChevronDown, ChevronRight, Database, History, RotateCcw, Save, ShieldCheck, Trash2, X } from 'lucide-react'
-import type { Destination, DLPPolicy, Json, Rule } from '../types'
+import { Beaker, ChevronDown, ChevronRight, Database, History, RotateCcw, Save, ShieldCheck, Sliders, Trash2, X } from 'lucide-react'
+import type { Destination, DetectorItem, DLPPolicy, Json, Rule } from '../types'
 import { useLoad } from '../lib/hooks'
 import { formatTime, friendlyError } from '../lib/format'
 import { api, del, patch, post } from '../api'
 import { Empty, PanelTitle, StatusPill } from '../components/ui'
+
+const DETECTOR_CATEGORIES = [
+  { key: 'credential', label: '🔑 凭据与密钥 (Credentials)', desc: 'RSA/EC/SSH 私钥、API Token、数据库连接串、敏感变量赋值等' },
+  { key: 'pii', label: '👤 个人身份隐私 (PII)', desc: '身份证号、手机号码、电子邮箱、社会保障号 (SSN) 等' },
+  { key: 'source_code', label: '💻 源码与服务配置 (Source & Config)', desc: '代码片段特征及应用服务配置文件内容' },
+] as const
 
 export function Governance({ refresh }: { refresh: number }) {
   const [localRefresh, setLocalRefresh] = useState(0)
   const version = refresh + localRefresh
   const policies = useLoad<{ data: DLPPolicy[] }>(`/api/dlp-policies?v=${version}`, version).data?.data || []
   const targets = useLoad<{ data: Destination[] }>(`/api/destinations?v=${version}`, version).data?.data || []
+  const detectors = useLoad<{ data: DetectorItem[] }>(`/api/detectors?v=${version}`, version).data?.data || []
   const legacy = useLoad<{ data: Rule[] }>(`/api/rules?v=${version}`, version).data?.data || []
 
   const [policyText, setPolicyText] = useState('凭据、PII 或源码发往外部模型时告警。')
@@ -175,6 +182,46 @@ export function Governance({ refresh }: { refresh: number }) {
             </article>
           ))}
           {!policies.length && <Empty text="暂无自定义出站策略；内置敏感数据外发告警始终生效" />}
+        </div>
+      </section>
+
+      {/* 内置确定性检测器矩阵 */}
+      <section className="panel" style={{ gridColumn: '1 / -1' }}>
+        <PanelTitle
+          title="内置确定性硬检测器矩阵 (Built-in Detectors)"
+          subtitle="本地毫秒级正则表达式扫描凭据、PII、源码；内置检测器始终启用，命中后产生确定性告警，不能被 LLM 降级"
+        />
+
+        <div className="detector-matrix-grid">
+          {DETECTOR_CATEGORIES.map(cat => {
+            const items = detectors.filter(d => d.category === cat.key)
+            return (
+              <div key={cat.key} className="detector-category-box">
+                <div className="category-header">
+                  <b>{cat.label}</b>
+                  <span>{cat.desc}</span>
+                </div>
+                <div className="detector-items">
+                  {items.map(item => (
+                    <div key={item.id} className="detector-item-card enabled">
+                      <div className="detector-item-info">
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                          <b className="detector-name">{item.name}</b>
+                          <code>{item.id}</code>
+                        </div>
+                        <p className="detector-desc">{item.description}</p>
+                        <code className="detector-pattern" title={item.pattern}>
+                          {item.pattern}
+                        </code>
+                      </div>
+                      <span className="mode-badge">始终启用</span>
+                    </div>
+                  ))}
+                  {!items.length && <p style={{ fontSize: '12px', color: 'var(--muted)' }}>加载中…</p>}
+                </div>
+              </div>
+            )
+          })}
         </div>
       </section>
 

@@ -64,12 +64,20 @@ class DLPDetectorTests(unittest.TestCase):
         self.assertEqual(result["policy_decision"], "alert")
         self.assertIn("builtin-sensitive-external", result["matched_policies"])
 
+    def test_builtin_detector_is_not_a_runtime_bypass_option(self):
+        payload = {"model": "m", "messages": [{"role": "user", "content": "sk-abcdefghijklmnop"}]}
+        self.assertEqual(
+            evaluate_dlp(payload, protocol="openai_chat_completions", upstream="https://proxy", identity={})["policy_decision"],
+            "alert",
+        )
+
     @patch.dict(os.environ, {
         "AUTOMODE_FAST_URL": "http://fast.test/v1/chat/completions", "AUTOMODE_FAST_MODEL": "fast",
         "AUTOMODE_DEEP_URL": "http://deep.test/v1/chat/completions", "AUTOMODE_DEEP_MODEL": "deep",
     }, clear=False)
     def test_review_policy_uses_only_redacted_signals_and_fails_through_to_deep(self):
         captured = {}
+        captured_settings = {}
         payload = {"model": "corp-m", "messages": [{"role": "user", "content": "password=hunter2"}]}
         policy = {
             "id": "review", "version": 1, "enabled": True, "effect": "review",
@@ -78,11 +86,13 @@ class DLPDetectorTests(unittest.TestCase):
         target = {"id": "t", "name": "Corp", "upstream_pattern": "*", "model_pattern": "corp-*", "trust": "trusted", "enabled": True}
         def fast(settings, value):
             captured.update(value)
+            captured_settings["prompt"] = settings.prompt_override["outbound_dlp"]
             return {"decision": "uncertain", "risk": "medium", "policy_assessment": "ambiguous", "reason_code": "FAST_UNCERTAIN", "reason": "Needs deeper review"}
         def deep(settings, value):
             return {"decision": "allow", "risk": "medium", "policy_assessment": "safe", "reason_code": "REDACTED_CONTEXT_SAFE", "reason": "Redacted context is acceptable"}
-        result = evaluate_dlp(payload, protocol="openai_chat_completions", upstream="https://proxy", identity={}, targets=[target], policies=[policy], fast_transport=fast, deep_transport=deep)
+        result = evaluate_dlp(payload, protocol="openai_chat_completions", upstream="https://proxy", identity={}, targets=[target], policies=[policy], prompts={"outbound_dlp": "custom dlp prompt"}, fast_transport=fast, deep_transport=deep)
         self.assertEqual((result["policy_decision"], result["semantic_status"], result["final_stage"]), ("allow", "resolved", "deep_llm"))
+        self.assertEqual(captured_settings["prompt"], "custom dlp prompt")
         serialized = json.dumps(captured, ensure_ascii=False)
         self.assertNotIn("hunter2", serialized)
         self.assertIn("REDACTED:CREDENTIAL", serialized)

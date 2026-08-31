@@ -19,6 +19,11 @@ export interface Session {
   max_risk: Risk
   conversation_fingerprint?: string | null
   authorization?: Json
+  dlp_findings_count?: number
+  dlp_categories?: string[]
+  has_dlp_alert?: boolean
+  has_intent_alert?: boolean
+  intent_risk?: Risk
 }
 
 export interface ReviewEvent {
@@ -160,6 +165,24 @@ export interface Alert {
   evidence_id?: string | null
   data_findings?: DataFinding[]
   destination?: Destination
+  alert_type?: 'dlp' | 'intent_action'
+  data_categories?: string[]
+  destination_name?: string
+  destination_trust?: 'trusted' | 'external'
+}
+
+export interface DetectorItem {
+  id: string
+  name: string
+  category: 'credential' | 'pii' | 'source_code' | 'admin_keyword'
+  description: string
+  pattern: string
+  enabled: boolean
+}
+
+export interface PromptsResponse {
+  data: Record<string, string>
+  defaults: Record<string, string>
 }
 
 export interface TraceDetail {

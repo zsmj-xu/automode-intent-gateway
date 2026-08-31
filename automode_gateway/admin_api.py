@@ -42,6 +42,10 @@ def register_admin_routes(app: web.Application, store: TraceStore) -> None:
     routes.add_get("/api/alerts/{alert_id}", alert)
     routes.add_patch("/api/alerts/{alert_id}", update_alert)
     routes.add_post("/api/alerts/{alert_id}/feedback", alert_feedback)
+    routes.add_get("/api/prompts", get_prompts_handler)
+    routes.add_patch("/api/prompts", update_prompts_handler)
+    routes.add_post("/api/prompts/reset", reset_prompts_handler)
+    routes.add_get("/api/detectors", get_detectors_handler)
     routes.add_get("/api/rules", rules)
     routes.add_post("/api/rules/compile", compile_rule)
     routes.add_post("/api/rules/test", test_rule)
@@ -81,7 +85,7 @@ async def dashboard(request: web.Request) -> web.Response:
 
 
 async def sessions(request: web.Request) -> web.Response:
-    filters = {key: request.query.get(key) for key in ("protocol", "model", "risk", "decision", "capability", "since")}
+    filters = {key: request.query.get(key) for key in ("protocol", "model", "risk", "decision", "capability", "since", "category")}
     return web.json_response({"data": await _store_call(request, "sessions", _limit(request), **filters)})
 
 
@@ -123,7 +127,43 @@ async def events(request: web.Request) -> web.StreamResponse:
 
 
 async def alerts(request: web.Request) -> web.Response:
-    return web.json_response({"data": await _store_call(request, "alerts", _limit(request), request.query.get("status"))})
+    alert_type = request.query.get("alert_type") or request.query.get("category")
+    return web.json_response({"data": await _store_call(request, "alerts", _limit(request), request.query.get("status"), alert_type)})
+
+
+async def get_prompts_handler(request: web.Request) -> web.Response:
+    prompts = await _store_call(request, "get_prompts")
+    defaults = await _store_call(request, "get_default_prompts")
+    return web.json_response({"data": prompts, "defaults": defaults})
+
+
+async def update_prompts_handler(request: web.Request) -> web.Response:
+    body = await _json(request)
+    prompts = body.get("prompts")
+    if not isinstance(prompts, dict) or not prompts:
+        raise web.HTTPBadRequest(text="prompts object is required")
+    try:
+        updated = await _store_call(request, "update_prompts", prompts)
+        defaults = await _store_call(request, "get_default_prompts")
+        return web.json_response({"data": updated, "defaults": defaults})
+    except ValueError as exc:
+        raise web.HTTPBadRequest(text=str(exc)) from exc
+
+
+async def reset_prompts_handler(request: web.Request) -> web.Response:
+    body = await _json(request) if request.can_read_body else {}
+    name = body.get("name") if isinstance(body, dict) else None
+    try:
+        updated = await _store_call(request, "reset_prompts", name)
+        defaults = await _store_call(request, "get_default_prompts")
+        return web.json_response({"data": updated, "defaults": defaults})
+    except ValueError as exc:
+        raise web.HTTPBadRequest(text=str(exc)) from exc
+
+
+async def get_detectors_handler(request: web.Request) -> web.Response:
+    data = await _store_call(request, "get_detectors")
+    return web.json_response({"data": data})
 
 
 async def alert(request: web.Request) -> web.Response:
@@ -267,6 +307,7 @@ async def playground_classify(request: web.Request) -> web.Response:
         evaluate_dlp, payload, protocol=protocol, upstream=request.app[UPSTREAM_KEY],
         identity={"trusted": False, "roles": []}, targets=await _store_call(request, "list_destinations"),
         policies=await _store_call(request, "list_dlp_policies", True),
+        prompts=await _store_call(request, "get_prompts"),
     )
     return web.json_response(result)
 
@@ -280,6 +321,7 @@ async def replay(request: web.Request) -> web.Response:
         evaluate_dlp, body["payload"], protocol=body["protocol"], upstream=request.app[UPSTREAM_KEY],
         identity={"trusted": False, "roles": []}, targets=await _store_call(request, "list_destinations"),
         policies=await _store_call(request, "list_dlp_policies", True),
+        prompts=await _store_call(request, "get_prompts"),
     )
     return web.json_response({"replay_of": request.match_info["trace_id"], "result": result, "redacted_input": True})
 

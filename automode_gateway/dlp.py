@@ -60,7 +60,91 @@ def _trusted_peer(peer: str, trusted_cidrs: str | None) -> bool:
         return False
 
 
-def scan_payload(payload: Any, keyword_policies: Iterable[dict[str, Any]] = ()) -> list[dict[str, Any]]:
+BUILTIN_DETECTORS: list[dict[str, Any]] = [
+    {
+        "id": "private_key",
+        "name": "RSA/EC/SSH 私钥",
+        "category": "credential",
+        "description": "检测 PEM 格式的私钥证书内容 (BEGIN PRIVATE KEY)",
+        "pattern": r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----.*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
+    },
+    {
+        "id": "bearer_token",
+        "name": "Bearer 认证令牌",
+        "category": "credential",
+        "description": "检测请求文本中硬编码的 Bearer Token",
+        "pattern": r"\bBearer\s+[A-Za-z0-9._~+/=-]{12,}",
+    },
+    {
+        "id": "openai_key",
+        "name": "OpenAI API Key",
+        "category": "credential",
+        "description": "检测 sk-... 格式的 OpenAI / 兼容模型 API Key",
+        "pattern": r"\bsk-[A-Za-z0-9_-]{12,}\b",
+    },
+    {
+        "id": "aws_access_key",
+        "name": "AWS Access Key ID",
+        "category": "credential",
+        "description": "检测 AKIA... 格式的 AWS 访问密钥 ID",
+        "pattern": r"\bAKIA[0-9A-Z]{16}\b",
+    },
+    {
+        "id": "secret_assignment",
+        "name": "敏感变量/密码赋值",
+        "category": "credential",
+        "description": "检测 password/api_key/secret 等变量显式赋值",
+        "pattern": r"(?i)\b(?:api[_ -]?key|access[_ -]?token|password|passwd|secret)\b\s*[:=]\s*[^\s,;]{4,}",
+    },
+    {
+        "id": "connection_string",
+        "name": "数据库连接串 URI",
+        "category": "credential",
+        "description": "检测包含账密的 postgres/mysql/mongodb/redis 连接字符串",
+        "pattern": r"(?i)\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis)://[^\s:@/]+:[^\s@/]+@[^\s]+",
+    },
+    {
+        "id": "cn_identity",
+        "name": "中国大陆居民身份证号",
+        "category": "pii",
+        "description": "检测 18 位大陆身份证号（含生日校验位与校验码）",
+        "pattern": r"(?<!\d)[1-9]\d{5}(?:18|19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[0-9Xx](?!\d)",
+    },
+    {
+        "id": "us_ssn",
+        "name": "美国社会安全号 (SSN)",
+        "category": "pii",
+        "description": "检测 xxx-xx-xxxx 格式的 SSN",
+        "pattern": r"(?<!\d)\d{3}-\d{2}-\d{4}(?!\d)",
+    },
+    {
+        "id": "cn_phone",
+        "name": "中国大陆手机号",
+        "category": "pii",
+        "description": "检测 1[3-9] 开头的 11 位手机号码",
+        "pattern": r"(?<!\d)1[3-9]\d{9}(?!\d)",
+    },
+    {
+        "id": "email",
+        "name": "电子邮箱地址",
+        "category": "pii",
+        "description": "检测符合 RFC 格式的标准电子邮箱地址",
+        "pattern": r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
+    },
+    {
+        "id": "source_or_config",
+        "name": "源码片段与配置文件",
+        "category": "source_code",
+        "description": "检测代码块 (Python/JS/SQL/Go/YAML/INI等) 与服务配置文本",
+        "pattern": "multi-line regex signals",
+    },
+]
+
+
+def scan_payload(
+    payload: Any,
+    keyword_policies: Iterable[dict[str, Any]] = (),
+) -> list[dict[str, Any]]:
     keywords: list[tuple[str, str]] = []
     for policy in keyword_policies:
         policy_id = str(policy.get("id", "policy"))
@@ -88,7 +172,11 @@ def _walk_strings(value: Any, path: str = "$") -> Iterable[tuple[str, str]]:
         yield path, value
 
 
-def _scan_text(path: str, text: str, keywords: list[tuple[str, str]]) -> list[DataFinding]:
+def _scan_text(
+    path: str,
+    text: str,
+    keywords: list[tuple[str, str]],
+) -> list[DataFinding]:
     import hashlib
 
     matches: list[tuple[str, int, int, str, str]] = []
@@ -214,6 +302,7 @@ def evaluate_dlp(
     identity: dict[str, Any],
     targets: Iterable[dict[str, Any]] = (),
     policies: Iterable[dict[str, Any]] = (),
+    prompts: dict[str, str] | None = None,
     fast_transport: Transport | None = None,
     deep_transport: Transport | None = None,
 ) -> dict[str, Any]:
@@ -251,13 +340,13 @@ def evaluate_dlp(
     if review_match and not hard_alert:
         semantic_status = "needs_review"
         signals = _review_signals(findings, destination, identity)
-        fast = LLMClassifier(ReviewerSettings.from_env("fast"), fast_transport).run(signals, stages, review_object="outbound_dlp")
+        fast = LLMClassifier(ReviewerSettings.from_env("fast", prompt_override=prompts), fast_transport).run(signals, stages, review_object="outbound_dlp")
         stages.append(fast.to_dict())
         final = fast
         if fast.status == "completed" and fast.verdict == "allow":
             decision, semantic_status = "allow", "resolved"
         else:
-            deep = LLMClassifier(ReviewerSettings.from_env("deep"), deep_transport).run(signals, stages, review_object="outbound_dlp")
+            deep = LLMClassifier(ReviewerSettings.from_env("deep", prompt_override=prompts), deep_transport).run(signals, stages, review_object="outbound_dlp")
             stages.append(deep.to_dict())
             final = deep
             if deep.status == "completed" and deep.verdict == "allow":

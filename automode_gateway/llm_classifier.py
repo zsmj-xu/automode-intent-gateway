@@ -56,6 +56,11 @@ risk (low|medium|high|critical), policy_assessment (safe|harmful|ambiguous), rea
 Use a short stable uppercase reason_code and one concise reason of no more than 80 characters."""
 
 
+DEFAULT_PROMPTS: dict[str, str] = {
+    "outbound_dlp": DLP_SYSTEM_PROMPT,
+}
+
+
 @dataclass(frozen=True)
 class ReviewerSettings:
     stage: str
@@ -65,9 +70,10 @@ class ReviewerSettings:
     timeout: float
     max_tokens: int
     thinking: bool
+    prompt_override: dict[str, str] | None = None
 
     @classmethod
-    def from_env(cls, stage: str) -> "ReviewerSettings":
+    def from_env(cls, stage: str, prompt_override: dict[str, str] | None = None) -> "ReviewerSettings":
         prefix = f"AUTOMODE_{stage.upper()}_"
         fallback = "AUTOMODE_REVIEWER_"
         value = lambda suffix, default=None: os.getenv(prefix + suffix, os.getenv(fallback + suffix, default))
@@ -79,6 +85,7 @@ class ReviewerSettings:
             timeout=float(value("TIMEOUT", "10")),
             max_tokens=int(value("MAX_TOKENS", "2400")),
             thinking=stage == "deep",
+            prompt_override=prompt_override,
         )
 
 
@@ -145,7 +152,8 @@ class LLMClassifier:
 
 def _http_transport(settings: ReviewerSettings, input_data: dict[str, Any]) -> dict[str, Any]:
     review_object = input_data.get("review_object")
-    system_prompt = HUMAN_REQUEST_SYSTEM_PROMPT if review_object == "human_request" else DLP_SYSTEM_PROMPT if review_object == "outbound_dlp" else SYSTEM_PROMPT
+    default_prompt = HUMAN_REQUEST_SYSTEM_PROMPT if review_object == "human_request" else DLP_SYSTEM_PROMPT if review_object == "outbound_dlp" else SYSTEM_PROMPT
+    system_prompt = (settings.prompt_override or {}).get(str(review_object)) or default_prompt
     payload: dict[str, Any] = {
         "model": settings.model, "temperature": 0, "max_tokens": settings.max_tokens,
         "response_format": {"type": "json_object"},

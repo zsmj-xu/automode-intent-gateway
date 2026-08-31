@@ -225,13 +225,15 @@ class Gateway:
         identity: dict[str, Any],
     ) -> None:
         try:
-            targets, policies = await asyncio.gather(
+            targets, policies, prompts = await asyncio.gather(
                 asyncio.to_thread(self.store.list_destinations),
                 asyncio.to_thread(self.store.list_dlp_policies, True),
+                asyncio.to_thread(self.store.get_prompts),
             )
             result = await asyncio.to_thread(
                 evaluate_dlp, payload, protocol=protocol, upstream=self.upstream,
                 identity=identity, targets=targets, policies=policies,
+                prompts=prompts,
             )
             result["evidence_id"] = await asyncio.to_thread(
                 self.store.store_evidence, trace_id, payload, result["data_findings"], result["destination"]
