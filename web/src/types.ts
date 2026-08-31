@@ -22,7 +22,7 @@ export interface Session {
 }
 
 export interface ReviewEvent {
-  type: 'user' | 'tool_call' | 'session_authorization'
+  type: 'user' | 'tool_call' | 'session_authorization' | 'dlp_finding' | 'destination' | 'identity'
   text?: string
   phase?: 'historical' | 'proposed' | 'session'
   name?: string
@@ -35,6 +35,38 @@ export interface ReviewEvent {
   capabilities?: string[]
   forbidden_capabilities?: string[]
   statements?: string[]
+  category?: string
+  path?: string
+  confidence?: string
+  snippet?: string
+  trust?: string
+  model?: string | null
+  trusted?: boolean
+  user_id?: string | null
+  department?: string | null
+}
+
+export interface DataFinding {
+  category: 'credential' | 'pii' | 'source_code' | 'admin_keyword'
+  path: string
+  confidence: string
+  fingerprint: string
+  snippet: string
+  detector: string
+}
+
+export interface Destination {
+  id?: string | null
+  name: string
+  upstream_pattern?: string
+  model_pattern?: string
+  provider?: string | null
+  region?: string | null
+  trust: 'trusted' | 'external'
+  enabled?: boolean
+  model?: string | null
+  upstream?: string
+  matched?: boolean
 }
 
 export interface StageResult {
@@ -65,6 +97,18 @@ export interface Classification {
   final_stage: string
   risk: Risk
   action_alignment: string
+  review_object?: 'human_request' | 'tool_action' | 'outbound_request'
+  request_safety?: 'safe' | 'harmful' | 'ambiguous' | 'needs_review' | 'not_reviewed'
+  request_purpose?: 'normal' | 'suspicious' | 'unknown'
+  data_findings?: DataFinding[]
+  destination?: Destination
+  destination_trust?: 'trusted' | 'external'
+  policy_decision?: 'allow' | 'alert'
+  matched_policies?: string[]
+  matched_rules?: string[]
+  evidence_id?: string | null
+  identity?: Json
+  semantic_status?: 'not_needed' | 'needs_review' | 'resolved'
   reason_code: string
   reason: string
   started_at?: string
@@ -113,6 +157,9 @@ export interface Alert {
   acknowledged_at: string | null
   operator_note: string
   feedback: string | null
+  evidence_id?: string | null
+  data_findings?: DataFinding[]
+  destination?: Destination
 }
 
 export interface TraceDetail {
@@ -149,6 +196,27 @@ export interface DashboardData {
   top_reasons: Array<{ reason_code: string; count: number }>
   classification_latency_ms: { p50: number; p95: number }
   health: Record<string, string>
+  dlp?: {
+    reviewed: number
+    alerts: number
+    category_counts: Record<string, number>
+    destination_counts: Record<string, number>
+  }
+}
+
+export interface DLPPolicy {
+  id: string
+  name: string
+  original_text: string
+  effect: 'alert' | 'review'
+  priority: number
+  conditions: Json
+  reason_code: string
+  reason: string
+  version: number
+  enabled: boolean
+  created_at: string
+  updated_at: string
 }
 
 export interface Rule {

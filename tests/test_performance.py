@@ -164,8 +164,9 @@ class LargeResponseTests(unittest.IsolatedAsyncioTestCase):
                         break
                     await asyncio.sleep(0.01)
             self.assertEqual(trace["response_bytes"], total_size)
-            self.assertEqual(trace["final_decision"], "alert")
-            self.assertEqual(trace["classification"]["proposed_actions"][0]["name"], "response_capture_incomplete")
+            self.assertEqual(trace["final_decision"], "allow")
+            self.assertEqual(trace["classification"]["review_object"], "outbound_request")
+            self.assertFalse(trace["response_capture_complete"])
             gc.collect()
             after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
             # On macOS ru_maxrss is bytes. The gateway capture stays bounded well below response size.

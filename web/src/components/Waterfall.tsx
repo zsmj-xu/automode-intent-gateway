@@ -30,7 +30,7 @@ export function DecisionWaterfall({ classification }: { classification: Classifi
         {open === 'final' && (
           <div className="stage-detail">
             <Row k="阶段" v={final.stage} />
-            <Row k="意图对齐" v={ALIGNMENT_LABEL[final.action_alignment] || final.action_alignment} />
+            <Row k={classification.review_object === 'outbound_request' ? '策略结论' : classification.review_object === 'human_request' ? '人的需求安全性' : '意图对齐'} v={classification.policy_decision || classification.request_safety || ALIGNMENT_LABEL[final.action_alignment] || final.action_alignment} />
             <Row k="耗时" v={final.total_latency_ms != null ? `${final.total_latency_ms.toFixed(1)} ms` : '—'} />
             <div className="stage-reason">{final.reason || '无说明'}</div>
           </div>
@@ -93,6 +93,15 @@ export function ReviewContext({ transcript }: { transcript: ReviewEvent[] }) {
               </span>
             </div>
           )
+        }
+        if (event.type === 'dlp_finding') {
+          return <div className="rc-event proposed" key={index}><span className="rc-tag proposed">敏感数据</span><span className="rc-text"><b>{event.category}</b><code>{event.path}</code>{event.snippet && <span> · {event.snippet}</span>}</span></div>
+        }
+        if (event.type === 'destination') {
+          return <div className="rc-event" key={index}><span className="rc-tag session">模型目标</span><span className="rc-text"><b>{event.name || event.model || '未注册'}</b> · {event.trust}</span></div>
+        }
+        if (event.type === 'identity') {
+          return <div className="rc-event" key={index}><span className="rc-tag user">可信身份</span><span className="rc-text">{event.trusted ? `${event.user_id || '未知用户'} · ${event.department || '未知部门'}` : '未提供可信身份'}</span></div>
         }
         const proposed = event.phase === 'proposed'
         return (

@@ -6,7 +6,7 @@ import { CommandPalette } from './components/CommandPalette'
 import { Dashboard } from './pages/Dashboard'
 import { Sessions } from './pages/Sessions'
 import { Alerts } from './pages/Alerts'
-import { Rules } from './pages/Rules'
+import { Governance } from './pages/Governance'
 import { Playground } from './pages/Playground'
 import { SettingsPage } from './pages/Settings'
 
@@ -15,7 +15,7 @@ const pages: Array<{ id: Page; label: string; icon: typeof Gauge }> = [
   { id: 'dashboard', label: '总览', icon: Gauge },
   { id: 'sessions', label: '会话', icon: Activity },
   { id: 'alerts', label: '告警', icon: AlertTriangle },
-  { id: 'rules', label: '规则', icon: BookOpenCheck },
+  { id: 'rules', label: '策略', icon: BookOpenCheck },
   { id: 'playground', label: '测试实验室', icon: Beaker },
   { id: 'settings', label: '设置', icon: Settings },
 ]
@@ -87,13 +87,30 @@ export function App() {
     run: () => setRefresh(value => value + 1),
   }]), [])
 
-  function navigate(target: Page) { setPage(target); setMenuOpen(false); window.location.hash = `/${target}` }
+  function navigate(target: Page) {
+    if (target === 'alerts') setAlertUnread(0)
+    setPage(target)
+    setMenuOpen(false)
+    window.location.hash = `/${target}`
+  }
+
   function openTrace(sessionId: string | null, traceId: string) {
     const params = new URLSearchParams()
     if (sessionId) params.set('session', sessionId)
     params.set('trace', traceId)
     window.history.replaceState(null, '', `${window.location.pathname}?${params.toString()}`)
     navigate('sessions')
+  }
+
+  function openSession(sessionId: string) {
+    const params = new URLSearchParams()
+    params.set('session', sessionId)
+    window.history.replaceState(null, '', `${window.location.pathname}?${params.toString()}`)
+    navigate('sessions')
+  }
+
+  function openAlert(alertId: string) {
+    navigate('alerts')
   }
 
   return (
@@ -114,7 +131,7 @@ export function App() {
       <main>
         <header>
           <button className="icon-button mobile-menu" aria-label="打开导航" onClick={() => setMenuOpen(true)}><Menu /></button>
-          <div><p className="eyebrow">INTENT SECURITY CONSOLE</p><h1>{title}</h1></div>
+          <div><p className="eyebrow">ENTERPRISE AI SHADOW DLP</p><h1>{title}</h1></div>
           <div className="header-actions">
             <button className="secondary compact" onClick={() => setPaletteOpen(true)}><span className="kbd">⌘K</span>命令</button>
             <button className="secondary compact" onClick={() => setRefresh(value => value + 1)}><RefreshCw size={16} />刷新</button>
@@ -123,15 +140,21 @@ export function App() {
         {authNeeded
           ? <AuthGate token={token} onSave={value => { setAdminToken(value); setToken(value); setAuthNeeded(false); setRefresh(r => r + 1) }} onClear={() => { setAdminToken(''); setToken(''); setAuthNeeded(false); setRefresh(r => r + 1) }} />
           : <div className="content">
-            {page === 'dashboard' && <Dashboard refresh={refresh} />}
+            {page === 'dashboard' && <Dashboard refresh={refresh} onOpenTrace={openTrace} onOpenAlerts={() => navigate('alerts')} />}
             {page === 'sessions' && <Sessions refresh={refresh} />}
             {page === 'alerts' && <Alerts refresh={refresh} onOpenTrace={openTrace} />}
-            {page === 'rules' && <Rules refresh={refresh} />}
+            {page === 'rules' && <Governance refresh={refresh} />}
             {page === 'playground' && <Playground />}
             {page === 'settings' && <SettingsPage />}
           </div>}
       </main>
-      <CommandPalette commands={commands} open={paletteOpen} onClose={() => setPaletteOpen(false)} />
+      <CommandPalette
+        commands={commands}
+        open={paletteOpen}
+        onClose={() => setPaletteOpen(false)}
+        onOpenSession={openSession}
+        onOpenAlert={openAlert}
+      />
       <ToastStack notices={notices} onDismiss={id => setNotices(value => value.filter(item => item.id !== id))} />
     </div>
   )

@@ -19,12 +19,12 @@ export function SettingsPage() {
   return (
     <div className="settings-grid">
       <section className="panel">
-        <PanelTitle title="运行模式" subtitle="MVP 默认观察，不阻断真实工具调用" />
-        <div className="setting-row"><div><b>Observe</b><span>记录、分类并生成告警</span></div><span className="mode-badge">当前模式</span></div>
-        <div className="setting-row disabled"><div><b>Enforce</b><span>预留的强制阻断模式</span></div><span>暂未开放</span></div>
+        <PanelTitle title="运行模式" subtitle="Shadow DLP 默认观察，不阻断目标模型调用" />
+        <div className="setting-row"><div><b>Shadow / Observe</b><span>扫描完整出站请求、记录并告警</span></div><span className="mode-badge">当前模式</span></div>
+        <div className="setting-row disabled"><div><b>Request Enforce</b><span>预留的模型调用前阻断模式</span></div><span>暂未开放</span></div>
       </section>
       <section className="panel model-settings">
-        <PanelTitle title="分类模型" subtitle="Fast 无思考，Deep 有思考；密钥永不回传或落库" />
+        <PanelTitle title="可选语义模型" subtitle="只处理强脱敏后的模糊上下文，不能推翻确定性 DLP 告警" />
         {(['fast', 'deep'] as const).map(stage => (
           <fieldset key={stage}>
             <legend>{stage === 'fast' ? 'Fast LLM' : 'Deep LLM'}</legend>
@@ -38,9 +38,10 @@ export function SettingsPage() {
         {result && <p className={result.startsWith('保存失败') ? 'form-error' : 'test-result'} role="status">{result}</p>}
       </section>
       <section className="panel">
-        <PanelTitle title="数据保留" subtitle="原始请求可关闭，结构化审计数据继续保留" />
-        <div className="setting-row"><div><b>原始请求</b><span>{data.store_raw ? '当前已保存（敏感字段脱敏）' : '当前不保存'}</span></div><CircleCheck size={20} /></div>
-        <div className="setting-row"><div><b>保留期限</b><span>{data.retention_days} 天</span></div></div>
+        <PanelTitle title="数据与信任边界" subtitle="普通 Trace 只保留脱敏副本" />
+        <div className="setting-row"><div><b>脱敏 Trace</b><span>{data.store_raw ? '保存脱敏请求和响应元数据' : '当前不保存请求副本'}</span></div><CircleCheck size={20} /></div>
+        <div className="setting-row"><div><b>加密原文证据</b><span>{data.evidence_encryption_configured ? 'AES-GCM 已配置，保留 30 天' : '未配置密钥，不保存原文证据'}</span></div></div>
+        <div className="setting-row"><div><b>可信代理网段</b><span>{data.trusted_proxy_cidrs_configured ? '已配置' : '未配置，身份头全部视为不可信'}</span></div></div>
       </section>
     </div>
   )

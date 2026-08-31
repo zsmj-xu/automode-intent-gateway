@@ -134,7 +134,7 @@ class ProxyIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(item["decision"] == "allow" for item in traces))
         self.assertTrue(all(item["session_id"] == "session-test" for item in traces))
 
-    async def test_response_tool_call_overwrites_trace_with_alignment_decision(self) -> None:
+    async def test_response_tool_call_is_evidence_and_does_not_replace_human_request_decision(self) -> None:
         payload = {
             "model": "claude-tool-test",
             "messages": [{"role": "user", "content": "检查代码，但不要 push。"}],
@@ -147,20 +147,42 @@ class ProxyIntegrationTests(unittest.IsolatedAsyncioTestCase):
             await response.read()
             trace_id = response.headers["x-automode-trace-id"]
 
-        for _ in range(20):
+        for _ in range(50):
             async with self.client.get(self.gateway.make_url(f"/traces/{trace_id}")) as response:
                 trace = await response.json()
-            if trace["classification"]["proposed_tool_calls"]:
+            detail = self.gateway.app[GATEWAY_KEY].store.session_detail(trace["session_record_id"])
+            if detail and detail["traces"][0]["tool_actions"] and trace["classification"].get("decision") != "pending":
                 break
             await asyncio.sleep(0.01)
 
         classification = trace["classification"]
-        self.assertEqual(classification["decision"], "deny")
-        self.assertEqual(classification["action_alignment"], "contradicted")
-        self.assertEqual(classification["proposed_tool_calls"][0]["name"], "Bash")
+        self.assertEqual(classification["decision"], "allow")
+        self.assertEqual(classification["review_object"], "outbound_request")
+        self.assertEqual(classification["policy_decision"], "allow")
+        self.assertEqual(detail["traces"][0]["tool_actions"][0]["tool_name"], "Bash")
         serialized = json.dumps(classification, ensure_ascii=False)
         self.assertNotIn("This must not be reviewed", serialized)
         self.assertNotIn("I will do it", serialized)
+
+    async def test_sensitive_request_is_forwarded_unchanged_but_trace_is_redacted_and_evidence_encrypted(self) -> None:
+        store = self.gateway.app[GATEWAY_KEY].store
+        store.evidence_key = bytes(range(32))
+        payload = {"model": "external-model", "messages": [{"role": "user", "content": "password=hunter2"}]}
+        async with self.client.post(self.gateway.make_url("/v1/chat/completions"), json=payload) as response:
+            self.assertEqual(response.status, 200)
+            trace_id = response.headers["x-automode-trace-id"]
+            await response.read()
+        for _ in range(100):
+            async with self.client.get(self.gateway.make_url(f"/traces/{trace_id}")) as response:
+                trace = await response.json()
+            if trace.get("classification", {}).get("evidence_id"):
+                break
+            await asyncio.sleep(0.01)
+        self.assertIn(b"hunter2", self.received[-1]["body"])
+        self.assertNotIn("hunter2", json.dumps(trace.get("request_body"), ensure_ascii=False))
+        self.assertEqual(trace["classification"]["policy_decision"], "alert")
+        evidence = store.evidence(trace["classification"]["evidence_id"], actor="test", purpose="integration", source="loopback")
+        self.assertEqual(evidence["payload"], payload)
 
     async def test_ac_p0_017_upstream_error_is_preserved_and_traced(self) -> None:
         payload = {"model": "upstream-error", "messages": [{"role": "user", "content": "hello"}]}
@@ -226,14 +248,15 @@ class ProxyIntegrationTests(unittest.IsolatedAsyncioTestCase):
         for _ in range(100):
             async with self.client.get(self.gateway.make_url(f"/traces/{trace_id}")) as response:
                 trace = await response.json()
-            if len(trace["classification"].get("proposed_actions", [])) == 3:
+            detail = self.gateway.app[GATEWAY_KEY].store.session_detail(trace["session_record_id"])
+            if detail and len(detail["traces"][0]["tool_actions"]) == 3 and trace["classification"].get("decision") != "pending":
                 break
             await asyncio.sleep(0.01)
         classification = trace["classification"]
-        self.assertEqual(len(classification["proposed_actions"]), 3)
-        self.assertEqual(classification["decision"], "deny")
-        self.assertEqual(classification["action_alignment"], "contradicted")
-        self.assertNotEqual(trace["declared_tool_count"], len(classification["proposed_actions"]))
+        self.assertEqual(len(detail["traces"][0]["tool_actions"]), 3)
+        self.assertEqual(classification["decision"], "allow")
+        self.assertEqual(classification["review_object"], "outbound_request")
+        self.assertNotEqual(trace["declared_tool_count"], len(detail["traces"][0]["tool_actions"]))
 
     async def test_conversation_fingerprint_groups_requests_without_session_header(self) -> None:
         opener = {"model": "fp-test", "messages": [{"role": "user", "content": "帮我重构这个模块"}]}

@@ -12,3 +12,4 @@ web/dist/
 *.db.pre-*
 *.bak
 .env
+.automode-evidence.key

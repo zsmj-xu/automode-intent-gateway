@@ -1,9 +1,10 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
+import { Eye, EyeOff, LockKeyhole, Save } from 'lucide-react'
 import type { Alert, AlertStatus } from '../types'
 import { useLoad } from '../lib/hooks'
 import { formatTime } from '../lib/format'
 import { Empty, ErrorState, Loading, PanelTitle, Risk, StatusPill } from '../components/ui'
-import { patch, post } from '../api'
+import { api, patch, post } from '../api'
 
 const STATUSES: AlertStatus[] = ['open', 'acknowledged', 'false_positive', 'resolved']
 const FEEDBACKS = [
@@ -16,21 +17,70 @@ export function Alerts({ refresh, onOpenTrace }: { refresh: number; onOpenTrace?
   const [statusFilter, setStatusFilter] = useState<string>('')
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [localRefresh, setLocalRefresh] = useState(0)
+  const [rawEvidence, setRawEvidence] = useState<unknown>(null)
+  const [evidenceError, setEvidenceError] = useState('')
+  const [evidenceBusy, setEvidenceBusy] = useState(false)
+  const [noteDraft, setNoteDraft] = useState('')
+  const [noteSaving, setNoteSaving] = useState(false)
+  const [noteStatus, setNoteStatus] = useState('')
+
   const { data, error } = useLoad<{ data: Alert[] }>(`/api/alerts?limit=200&status=${statusFilter}&v=${refresh + localRefresh}`, refresh + localRefresh)
   const rows = data?.data || []
+  const selected = rows.find(row => row.id === selectedId) || rows[0] || null
+
+  useEffect(() => {
+    setRawEvidence(null)
+    setEvidenceError('')
+    setNoteDraft(selected?.operator_note || '')
+    setNoteStatus('')
+  }, [selected?.id])
 
   if (error) return <ErrorState message={error} />
   if (!data) return <Loading />
-
-  const selected = rows.find(row => row.id === selectedId) || rows[0] || null
 
   async function setStatus(id: string, status: string) {
     await patch(`/api/alerts/${id}`, { status })
     setLocalRefresh(value => value + 1)
   }
+
   async function feedback(id: string, value: string) {
     await post(`/api/alerts/${id}/feedback`, { feedback: value })
     setLocalRefresh(value => value + 1)
+  }
+
+  async function saveNote() {
+    if (!selected) return
+    setNoteSaving(true)
+    setNoteStatus('')
+    try {
+      await patch(`/api/alerts/${selected.id}`, { operator_note: noteDraft })
+      setNoteStatus('备注已保存')
+      setLocalRefresh(value => value + 1)
+    } catch (err) {
+      setNoteStatus(`保存失败: ${(err as Error).message}`)
+    } finally {
+      setNoteSaving(false)
+    }
+  }
+
+  async function revealEvidence(evidenceId: string) {
+    setEvidenceBusy(true)
+    setEvidenceError('')
+    try {
+      setRawEvidence(await api(`/api/evidence/${evidenceId}/raw?purpose=incident_review`))
+    } catch (err) {
+      setEvidenceError((err as Error).message)
+    } finally {
+      setEvidenceBusy(false)
+    }
+  }
+
+  const STATUS_LABELS: Record<string, string> = {
+    '': '全部',
+    open: '开放',
+    acknowledged: '已确认',
+    false_positive: '误报项',
+    resolved: '已解决',
   }
 
   return (
@@ -39,66 +89,164 @@ export function Alerts({ refresh, onOpenTrace }: { refresh: number; onOpenTrace?
         <PanelTitle
           title="告警中心"
           subtitle="观察模式只记录和告警，不阻断 Agent"
-          actions={
-            <div className="segmented">
-              <button className={statusFilter === '' ? 'active' : ''} onClick={() => setStatusFilter('')}>全部</button>
-              {STATUSES.map(status => <button key={status} className={statusFilter === status ? 'active' : ''} onClick={() => setStatusFilter(status)}>{status}</button>)}
-            </div>
-          }
         />
+        <div className="alert-filter-segmented">
+          <button className={statusFilter === '' ? 'active' : ''} onClick={() => setStatusFilter('')}>全部</button>
+          {STATUSES.map(status => (
+            <button key={status} className={statusFilter === status ? 'active' : ''} onClick={() => setStatusFilter(status)}>
+              {STATUS_LABELS[status] || status}
+            </button>
+          ))}
+        </div>
         {rows.length ? (
           <div className="alert-list">
-            {rows.map(row => (
-              <button key={row.id} className={selected?.id === row.id ? 'alert-row selected' : 'alert-row'} onClick={() => setSelectedId(row.id)}>
-                <Risk level={row.severity} />
-                <div className="alert-row-body">
-                  <b>{row.title}</b>
-                  <code>{row.reason_code}</code>
-                  <span>{formatTime(row.created_at)}</span>
-                </div>
-                <StatusPill status={row.status} />
-              </button>
-            ))}
+            {rows.map(row => {
+              // 移除标题中重复的 severity 前缀
+              const cleanTitle = row.title.replace(/^(HIGH|MEDIUM|LOW|CRITICAL):\s*/i, '')
+              return (
+                <button key={row.id} className={selected?.id === row.id ? 'alert-row selected' : 'alert-row'} onClick={() => setSelectedId(row.id)}>
+                  <Risk level={row.severity} />
+                  <div className="alert-row-body">
+                    <b title={row.title}>{cleanTitle}</b>
+                    <code>{row.reason_code}</code>
+                    <span>{formatTime(row.created_at)}</span>
+                  </div>
+                  <StatusPill status={row.status} />
+                </button>
+              )
+            })}
           </div>
         ) : <Empty text="当前没有告警" />}
       </section>
+
       {selected ? (
         <section className="panel detail-panel">
           <div className="panel-heading">
-            <div><p className="eyebrow">ALERT DETAIL</p><h2>{selected.title}</h2><p className="detail-subtitle">{selected.reason_code} · {formatTime(selected.created_at)}</p></div>
+            <div>
+              <p className="eyebrow">ALERT DETAIL</p>
+              <h2>{selected.title}</h2>
+              <p className="detail-subtitle">{selected.reason_code} · {formatTime(selected.created_at)}</p>
+            </div>
             <StatusPill status={selected.status} />
           </div>
+
           <div className="alert-detail-body">
             <div className="detail-grid">
               <div><span>风险级别</span><Risk level={selected.severity} /></div>
               <div><span>判定阶段</span><b>{selected.final_stage}</b></div>
-              <div><span>原因</span><b>{selected.reason}</b></div>
+              <div><span>原因说明</span><b>{selected.reason}</b></div>
               {selected.acknowledged_at && <div><span>确认时间</span><b>{formatTime(selected.acknowledged_at)}</b></div>}
-              {selected.operator_note && <div><span>备注</span><b>{selected.operator_note}</b></div>}
+              {selected.destination && <div><span>模型目标</span><b>{selected.destination.name} · <StatusPill status={selected.destination.trust || 'external'} /></b></div>}
             </div>
-            {selected.evidence?.length > 0 && <div className="evidence"><b>授权证据</b>{selected.evidence.map(line => <span key={line}>{line}</span>)}</div>}
+
+            {!!selected.data_findings?.length && (
+              <div className="evidence">
+                <b>敏感数据发现</b>
+                {selected.data_findings.map((finding, index) => (
+                  <span key={`${finding.path}-${index}`}>
+                    <code>{finding.category}</code> {finding.path} · {finding.detector}
+                    {finding.snippet && <small style={{ display: 'block', color: '#f1c879', marginTop: '2px' }}>样例: {finding.snippet}</small>}
+                  </span>
+                ))}
+              </div>
+            )}
+
+            {selected.evidence?.length > 0 && (
+              <div className="evidence">
+                <b>脱敏 DLP 证据</b>
+                {selected.evidence.map(line => <span key={line}>{line}</span>)}
+              </div>
+            )}
+
             {selected.actions?.length > 0 && (
-              <div className="evidence"><b>拟执行动作</b>
+              <div className="evidence">
+                <b>模型动作旁证</b>
                 {selected.actions.map((action, index) => <span key={index}>{action.name}{action.target ? ` · ${action.target}` : ''}</span>)}
               </div>
             )}
-            {selected.matched_rules?.length > 0 && <div className="evidence"><b>命中规则</b>{selected.matched_rules.map(line => <code key={line}>{line}</code>)}</div>}
+
+            {selected.matched_rules?.length > 0 && (
+              <div className="evidence">
+                <b>命中规则/策略</b>
+                {selected.matched_rules.map(line => <code key={line}>{line}</code>)}
+              </div>
+            )}
+
+            {selected.evidence_id && (
+              <div className="raw-evidence-box">
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <LockKeyhole size={18} />
+                    <span><b>加密原文证据</b><small>仅允许本机管理 Token 解密；每次查看都会写入审计日志。</small></span>
+                  </div>
+                  {rawEvidence !== null && (
+                    <button className="secondary compact" onClick={() => setRawEvidence(null)}>
+                      <EyeOff size={14} />重新锁定 / 隐藏
+                    </button>
+                  )}
+                </div>
+
+                {rawEvidence === null && (
+                  <button className="secondary" disabled={evidenceBusy} onClick={() => revealEvidence(selected.evidence_id!)}>
+                    <Eye size={16} />{evidenceBusy ? '解密中…' : '解密查看原文'}
+                  </button>
+                )}
+                {evidenceError && <p className="form-error" role="alert">{evidenceError}</p>}
+                {rawEvidence !== null && (
+                  <details open>
+                    <summary>已解密证据原文</summary>
+                    <pre>{JSON.stringify(rawEvidence, null, 2)}</pre>
+                  </details>
+                )}
+              </div>
+            )}
+
+            <div className="triage">
+              <b>操作员备注</b>
+              <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                <input
+                  aria-label="操作员备注"
+                  placeholder="填写排查处置备注…"
+                  value={noteDraft}
+                  onChange={event => setNoteDraft(event.target.value)}
+                />
+                <button className="secondary compact" style={{ whiteSpace: 'nowrap' }} disabled={noteSaving || noteDraft === (selected.operator_note || '')} onClick={saveNote}>
+                  <Save size={14} />{noteSaving ? '保存中' : '保存备注'}
+                </button>
+              </div>
+              {noteStatus && <span style={{ fontSize: '11px', color: noteStatus.startsWith('保存失败') ? 'var(--danger)' : 'var(--safe)' }}>{noteStatus}</span>}
+            </div>
+
             <div className="triage">
               <b>处置状态</b>
               <div className="triage-actions">
-                {STATUSES.map(status => <button key={status} className={selected.status === status ? 'primary' : 'secondary'} disabled={selected.status === status} onClick={() => setStatus(selected.id, status)}>{status}</button>)}
+                {STATUSES.map(status => (
+                  <button key={status} className={selected.status === status ? 'primary' : 'secondary'} disabled={selected.status === status} onClick={() => setStatus(selected.id, status)}>
+                    {status}
+                  </button>
+                ))}
               </div>
             </div>
+
             <div className="triage">
               <b>人工反馈</b>
               <div className="triage-actions">
-                {FEEDBACKS.map(item => <button key={item.value} className="secondary" onClick={() => feedback(selected.id, item.value)}>{item.label}</button>)}
+                {FEEDBACKS.map(item => (
+                  <button key={item.value} className={selected.feedback === item.value ? 'primary' : 'secondary'} onClick={() => feedback(selected.id, item.value)}>
+                    {selected.feedback === item.value ? `✓ ${item.label}` : item.label}
+                  </button>
+                ))}
               </div>
             </div>
-            {onOpenTrace && <button className="primary" onClick={() => onOpenTrace(selected.session_record_id, selected.trace_id)}>↗ 在会话时间线中定位</button>}
+
+            {onOpenTrace && (
+              <button className="primary" style={{ marginTop: '8px' }} onClick={() => onOpenTrace(selected.session_record_id, selected.trace_id)}>
+                在会话时间线中定位 ↗
+              </button>
+            )}
           </div>
         </section>
-      ) : <section className="panel detail-empty"><h2>选择一条告警</h2><p>查看证据、拟执行动作并处置。</p></section>}
+      ) : <section className="panel detail-empty"><h2>选择一条告警</h2><p>查看敏感发现、目标模型、加密原文和模型动作旁证。</p></section>}
     </div>
   )
 }

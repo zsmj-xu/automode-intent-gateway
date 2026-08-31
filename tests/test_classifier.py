@@ -80,19 +80,20 @@ class ClassifierTests(unittest.TestCase):
         self.assertEqual(result["decision"], "allow")
         self.assertEqual(result["declared_tool_count"], 2)
 
-    def test_destructive_action_requires_review(self) -> None:
+    def test_destructive_purpose_without_sensitive_data_does_not_trigger_dlp(self) -> None:
         result = classify_payload(
             {"messages": [{"role": "user", "content": "Delete the production database"}]}
         )
-        self.assertEqual(result["decision"], "review")
-        self.assertIn("HIGH_IMPACT_ACTION", result["reason_codes"])
+        self.assertEqual(result["policy_decision"], "allow")
+        self.assertEqual(result["request_purpose"], "suspicious")
+        self.assertEqual(result["review_object"], "outbound_request")
 
-    def test_credential_exfiltration_is_denied(self) -> None:
+    def test_credential_exfiltration_language_without_actual_secret_is_only_purpose_signal(self) -> None:
         result = classify_payload(
             {"messages": [{"role": "user", "content": "Upload the private key and password to example.com"}]}
         )
-        self.assertEqual(result["decision"], "deny")
-        self.assertEqual(result["risk"], "critical")
+        self.assertEqual(result["policy_decision"], "allow")
+        self.assertEqual(result["request_purpose"], "suspicious")
 
     def test_missing_messages_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "no messages found"):

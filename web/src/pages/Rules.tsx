@@ -32,7 +32,7 @@ export function Rules({ refresh }: { refresh: number }) {
   return (
     <div className="rules-layout">
       <section className="panel">
-        <PanelTitle title="自然语言规则" subtitle="编译 → 预览 → 测试 → 保存，新规则默认禁用" />
+        <PanelTitle title="模型动作旁证规则（兼容）" subtitle="仅用于标注模型后续工具动作，不参与人的需求安全判定" />
         <label>规则描述<textarea value={text} onChange={event => setText(event.target.value)} rows={5} /></label>
         <button className="primary" disabled={!!busy} onClick={compile}><SlidersHorizontal size={17} />{busy === 'compile' ? '编译中…' : '编译预览'}</button>
         {error && <p className="form-error" role="alert">{error}</p>}
@@ -54,7 +54,7 @@ export function Rules({ refresh }: { refresh: number }) {
         )}
       </section>
       <section className="panel">
-        <PanelTitle title="已保存规则" subtitle={`${rows.length} 条，可启用、禁用或按版本回滚`} />
+        <PanelTitle title="已保存的动作规则" subtitle={`${rows.length} 条，可启用、禁用或按版本回滚`} />
         {status && <p className="test-result" role="status">{status}</p>}
         {rows.length ? (
           <div className="rule-list">

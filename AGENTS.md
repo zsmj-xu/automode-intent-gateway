@@ -1,8 +1,8 @@
-# AutoMode Intent Gateway
+# AutoMode Shadow DLP Gateway
 
 ## 定位
 
-位于 Agent 与模型之间的双协议透明观察网关，记录模型返回的工具调用，并按 `Rules → Fast LLM → Deep LLM` 进行意图与风险判定。
+位于 Agent 与模型之间的透明企业 AI 出站数据合规网关。主判定对象是完整出站模型请求、可信身份上下文和模型目标；本地检测敏感数据并按 DLP 策略告警。人的用途和模型工具调用仅保留为调查旁证。
 
 ## 启动与验证
 
@@ -21,14 +21,17 @@
 
 ## 约定与边界
 
-- 请求中的 `tools` 只是能力声明；只有模型响应中的 `tool_use`、`tool_calls` 或 `function_call` 才进入意图判断。
-- 审查输入只保留用户文本和工具调用意图，剔除 thinking/reasoning、普通回答、system/developer、tool result 和 Claude system reminder。
+- DLP 扫描完整出站 JSON 文本，包括 user/system/developer、tool result、历史消息和工具描述；暂不处理图片、音视频和二进制。
+- 凭据、PII、源码/配置和管理员关键词由本地确定性检测器识别；确定性告警不能被 LLM 降级。
+- 未注册模型目标默认 external；可信身份头只接受 `AUTOMODE_TRUSTED_PROXY_CIDRS` 中的直接连接来源，不信任 `X-Forwarded-For`。
+- 普通 Trace 只保存脱敏请求；原文证据仅在配置 AES-GCM 密钥时加密保存 30 天。
+- 模型响应中的工具调用单独落库为旁证，不触发或替代出站数据判定。
 - 当前是 Observe 模式：只记录、分类和告警，不执行或阻断 Agent 工具。
 - 不把 API Key、Cookie、真实生产数据或本地数据库提交到代码库；运行数据库和测试残留保留在本地。
 
 ## 当前状态
 
-- Anthropic Messages、OpenAI Chat Completions、OpenAI Responses、JSON/SSE 和规则控制台均已实现。
-- 自然语言规则采用受限结构化编译，支持预览、测试、确认、启停、版本和回滚。
-- 会话按优先级归组：显式 session id（header/metadata/`previous_response_id`）→ 会话内容指纹（`session_fingerprint.py`，校验前缀续接）→ trace 级 fallback；会话累积授权基线（capabilities/forbidden/statements）随请求沉淀，审查按会话而非单请求判定。
-- 当前验证基线为后端 95 个测试、前端 4 个测试和生产构建通过；Enforce/Action Gateway、SSO/RBAC 和多机部署仍未实现。
+- Anthropic Messages、OpenAI Chat Completions、OpenAI Responses、JSON/SSE 和 Shadow DLP 均已实现。
+- 出站数据策略采用独立受限结构化编译，支持预览、测试、启停和版本；旧动作规则仅作兼容旁证。
+- 会话按优先级归组：显式 session id（header/metadata/`previous_response_id`）→ 会话内容指纹（`session_fingerprint.py`，校验前缀续接）→ trace 级 fallback；历史 capability/constraint 摘要仅作旁证，DLP 结论以完整出站请求、可信身份和目标模型为输入。
+- 当前验证基线为后端 119 个测试、前端 6 个测试和生产构建通过；Request Enforce、Action Gateway、SSO/RBAC、KMS、OCR 和多机部署仍未实现。

@@ -9,6 +9,11 @@ const compiled = {
   conditions: { capabilities: ['publish'], target_environment: [], target_contains: [] },
   effect: 'always_alert', priority: 100, reason_code: 'PUBLISH_ALWAYS_ALERT', reason: '发布动作需要告警',
 }
+const dlpCompiled = {
+  name: '敏感数据外发', original_text: '凭据或源码发往外部模型时告警', effect: 'alert', priority: 100,
+  conditions: { data_categories: ['credential', 'source_code'], destination_trust: ['external'], departments: [], roles: [], agent_ids: [], models: [], keywords: [] },
+  reason_code: 'CUSTOM_DLP_ALERT', reason: '敏感数据外发',
+}
 
 const dashboardPayload = { trace_count: 0, session_count: 0, open_alert_count: 0, alert_rate: 0, decisions: {}, stage_counts: {}, top_reasons: [], classification_latency_ms: {}, health: {} }
 
@@ -19,6 +24,9 @@ beforeEach(() => {
     const path = String(input)
     let value: unknown = { data: [] }
     if (path === '/api/dashboard') value = dashboardPayload
+    if (path.startsWith('/api/dlp-policies/compile')) value = { valid: true, compiled: dlpCompiled }
+    if (path.startsWith('/api/dlp-policies/test')) value = { policy_decision: 'alert', data_findings: [{ category: 'credential' }] }
+    if (path === '/api/dlp-policies') value = { id: 'p1', ...dlpCompiled, enabled: false, version: 1 }
     if (path === '/api/rules/compile') value = { valid: true, requires_confirmation: true, compiled }
     if (path === '/api/rules/test') value = { matched: true, stage: { reason_code: 'PUBLISH_ALWAYS_ALERT' } }
     if (path === '/api/rules') value = { id: 'r1', ...compiled, enabled: false, version: 1 }
@@ -30,39 +38,38 @@ afterEach(cleanup)
 test('renders accessible navigation and closes its drawer with Escape', async () => {
   const { container } = render(<App />)
   expect(screen.getByRole('navigation', { name: '主导航' })).toBeInTheDocument()
-  expect(await screen.findByText('模型调用')).toBeInTheDocument()
+  expect(await screen.findByText('出站请求')).toBeInTheDocument()
   fireEvent.click(screen.getByRole('button', { name: '打开导航' }))
   expect(container.querySelector('.sidebar')).toHaveClass('open')
   fireEvent.keyDown(window, { key: 'Escape' })
   expect(container.querySelector('.sidebar')).not.toHaveClass('open')
 })
 
-test('completes natural-language rule preview, test, confirm and save flow', async () => {
+test('completes outbound DLP policy preview, test and save flow', async () => {
   render(<App />)
-  fireEvent.click(screen.getByRole('button', { name: '规则' }))
-  await screen.findByText('自然语言规则')
+  fireEvent.click(screen.getByRole('button', { name: '策略' }))
+  await screen.findByText('出站数据策略')
   fireEvent.click(screen.getByRole('button', { name: '编译预览' }))
-  expect(await screen.findByText('结构化规则')).toBeInTheDocument()
-  fireEvent.click(screen.getByRole('button', { name: '测试规则' }))
-  expect(await screen.findByText(/已命中/)).toBeInTheDocument()
-  fireEvent.click(screen.getByRole('checkbox', { name: /我确认/ }))
-  fireEvent.click(screen.getByRole('button', { name: '保存规则' }))
-  expect(await screen.findByText(/规则已保存/)).toBeInTheDocument()
-  await waitFor(() => expect(fetch).toHaveBeenCalledWith('/api/rules', expect.objectContaining({ method: 'POST' })))
+  expect(await screen.findByText('结构化条件')).toBeInTheDocument()
+  fireEvent.click(screen.getByRole('button', { name: '测试' }))
+  expect(await screen.findByText(/alert · 1 个敏感发现/)).toBeInTheDocument()
+  fireEvent.click(screen.getByRole('button', { name: '保存策略' }))
+  expect(await screen.findByText(/策略已保存/)).toBeInTheDocument()
+  await waitFor(() => expect(fetch).toHaveBeenCalledWith('/api/dlp-policies', expect.objectContaining({ method: 'POST' })))
 })
 
-test('playground exposes all protocols, raw mode, history and rules-only mode', async () => {
+test('playground exposes all protocols, raw mode and local DLP mode', async () => {
   render(<App />)
   fireEvent.click(screen.getByRole('button', { name: '测试实验室' }))
-  await screen.findByText('构造测试')
+  await screen.findByText('构造出站请求')
   const protocol = screen.getByLabelText('协议')
   expect(protocol).toHaveTextContent('Anthropic Messages')
   expect(protocol).toHaveTextContent('OpenAI Chat Completions')
   expect(protocol).toHaveTextContent('OpenAI Responses')
   fireEvent.click(screen.getByRole('button', { name: '原始 JSON' }))
   expect(screen.getByLabelText('请求 JSON')).toBeInTheDocument()
-  expect(screen.getByLabelText('判定范围')).toHaveTextContent('仅 Rules')
-  expect(screen.getByText(/不会执行真实工具/)).toBeInTheDocument()
+  expect(screen.getByLabelText('检测范围')).toHaveTextContent('本地确定性检测')
+  expect(screen.getByText(/不执行工具/)).toBeInTheDocument()
 })
 
 const jsonOk = (value: unknown) => ({ ok: true, status: 200, json: async () => value, text: async () => '' })
@@ -91,9 +98,9 @@ test('sessions page renders the audit timeline with full decision report and rev
   }))
   render(<App />)
   fireEvent.click(screen.getByRole('button', { name: '会话' }))
-  expect(await screen.findByText('会话审计')).toBeInTheDocument()
+  expect(await screen.findByText('出站请求审计')).toBeInTheDocument()
   expect(await screen.findByText('审查上下文（分类器实际看到的内容）')).toBeInTheDocument()
-  expect(await screen.findByText('拟调用工具')).toBeInTheDocument()
+  expect(await screen.findByText('模型动作旁证')).toBeInTheDocument()
   expect(screen.getAllByText('不要 push').length).toBeGreaterThan(0)
 })
 
@@ -132,6 +139,6 @@ test('shows the auth gate on 401 and unlocks after entering the admin token', as
   expect(await screen.findByRole('dialog', { name: '管理端认证' })).toBeInTheDocument()
   fireEvent.change(screen.getByLabelText('管理 Token'), { target: { value: 'secret-token' } })
   fireEvent.click(screen.getByRole('button', { name: /保存并连接/ }))
-  expect(await screen.findByText('模型调用')).toBeInTheDocument()
+  expect(await screen.findByText('出站请求')).toBeInTheDocument()
   expect(localStorage.getItem('automode.adminToken')).toBe('secret-token')
 })

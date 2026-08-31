@@ -8,13 +8,17 @@ import shutil
 import sqlite3
 import uuid
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from .classifier import authorization_signals
+from .dlp import redact_payload, scan_payload
+from .evidence import decrypt as decrypt_evidence
+from .evidence import encrypt as encrypt_evidence
+from .evidence import load_key
 from .normalizer import extract_messages, normalize
-from .review_context import build_review_context
+from .review_context import build_review_context, normalize_tool_call
 from .session_fingerprint import conversation_fingerprint as fingerprint_messages
 from .session_fingerprint import messages_are_continuation
 
@@ -73,6 +77,16 @@ CREATE TABLE IF NOT EXISTS classification_runs (
     final_decision TEXT NOT NULL, final_stage TEXT NOT NULL, risk TEXT NOT NULL,
     action_alignment TEXT NOT NULL, reason_code TEXT NOT NULL, reason TEXT NOT NULL,
     started_at TEXT NOT NULL, completed_at TEXT NOT NULL, total_latency_ms REAL NOT NULL,
+    review_object TEXT NOT NULL DEFAULT 'tool_action',
+    request_safety TEXT NOT NULL DEFAULT 'not_reviewed',
+    request_purpose TEXT NOT NULL DEFAULT 'unknown',
+    data_findings_json TEXT NOT NULL DEFAULT '[]',
+    destination_json TEXT NOT NULL DEFAULT '{}',
+    policy_decision TEXT NOT NULL DEFAULT 'allow',
+    matched_policies_json TEXT NOT NULL DEFAULT '[]',
+    evidence_id TEXT,
+    identity_json TEXT NOT NULL DEFAULT '{}',
+    semantic_status TEXT NOT NULL DEFAULT 'not_needed',
     FOREIGN KEY(trace_id) REFERENCES traces(id)
 );
 CREATE TABLE IF NOT EXISTS classification_stages (
@@ -100,6 +114,7 @@ CREATE TABLE IF NOT EXISTS alerts (
     status TEXT NOT NULL DEFAULT 'open', reason_code TEXT NOT NULL, title TEXT NOT NULL,
     reason TEXT NOT NULL, evidence_json TEXT NOT NULL, actions_json TEXT NOT NULL,
     matched_rules_json TEXT NOT NULL, final_stage TEXT NOT NULL,
+    evidence_id TEXT, data_findings_json TEXT NOT NULL DEFAULT '[]', destination_json TEXT NOT NULL DEFAULT '{}',
     acknowledged_at TEXT, operator_note TEXT, feedback TEXT,
     FOREIGN KEY(trace_id) REFERENCES traces(id)
 );
@@ -114,6 +129,34 @@ CREATE TABLE IF NOT EXISTS settings (
 CREATE TABLE IF NOT EXISTS audit_log (
     id TEXT PRIMARY KEY, created_at TEXT NOT NULL, action TEXT NOT NULL,
     entity_type TEXT NOT NULL, entity_id TEXT, detail_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS destinations (
+    id TEXT PRIMARY KEY, name TEXT NOT NULL, upstream_pattern TEXT NOT NULL,
+    model_pattern TEXT NOT NULL, provider TEXT, region TEXT,
+    trust TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS dlp_policies (
+    id TEXT PRIMARY KEY, name TEXT NOT NULL, original_text TEXT NOT NULL,
+    current_version INTEGER NOT NULL, enabled INTEGER NOT NULL DEFAULT 0,
+    compiled_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS dlp_policy_versions (
+    id TEXT PRIMARY KEY, policy_id TEXT NOT NULL, version INTEGER NOT NULL,
+    original_text TEXT NOT NULL, compiled_json TEXT NOT NULL, created_at TEXT NOT NULL,
+    UNIQUE(policy_id, version), FOREIGN KEY(policy_id) REFERENCES dlp_policies(id)
+);
+CREATE TABLE IF NOT EXISTS encrypted_evidence (
+    id TEXT PRIMARY KEY, trace_id TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+    nonce BLOB NOT NULL, ciphertext BLOB NOT NULL, content_hash TEXT NOT NULL,
+    categories_json TEXT NOT NULL, locations_json TEXT NOT NULL, destination_json TEXT NOT NULL,
+    FOREIGN KEY(trace_id) REFERENCES traces(id)
+);
+CREATE INDEX IF NOT EXISTS idx_evidence_trace ON encrypted_evidence(trace_id);
+CREATE INDEX IF NOT EXISTS idx_evidence_expiry ON encrypted_evidence(expires_at);
+CREATE TABLE IF NOT EXISTS evidence_access_log (
+    id TEXT PRIMARY KEY, evidence_id TEXT NOT NULL, accessed_at TEXT NOT NULL,
+    actor TEXT NOT NULL, purpose TEXT NOT NULL, source TEXT NOT NULL
 );
 """
 
@@ -133,6 +176,25 @@ TRACE_COLUMNS = {
 STAGE_COLUMNS = {
     "matched_rule_versions_json": "TEXT NOT NULL DEFAULT '[]'",
     "evidence_json": "TEXT NOT NULL DEFAULT '[]'",
+}
+
+ALERT_COLUMNS = {
+    "evidence_id": "TEXT",
+    "data_findings_json": "TEXT NOT NULL DEFAULT '[]'",
+    "destination_json": "TEXT NOT NULL DEFAULT '{}'",
+}
+
+RUN_COLUMNS = {
+    "review_object": "TEXT NOT NULL DEFAULT 'tool_action'",
+    "request_safety": "TEXT NOT NULL DEFAULT 'not_reviewed'",
+    "request_purpose": "TEXT NOT NULL DEFAULT 'unknown'",
+    "data_findings_json": "TEXT NOT NULL DEFAULT '[]'",
+    "destination_json": "TEXT NOT NULL DEFAULT '{}'",
+    "policy_decision": "TEXT NOT NULL DEFAULT 'allow'",
+    "matched_policies_json": "TEXT NOT NULL DEFAULT '[]'",
+    "evidence_id": "TEXT",
+    "identity_json": "TEXT NOT NULL DEFAULT '{}'",
+    "semantic_status": "TEXT NOT NULL DEFAULT 'not_needed'",
 }
 
 SESSION_COLUMNS = {
@@ -162,10 +224,12 @@ class ClosingConnection(sqlite3.Connection):
 
 
 class TraceStore:
-    def __init__(self, path: str | Path, store_raw: bool = True) -> None:
+    def __init__(self, path: str | Path, store_raw: bool = True, evidence_key: bytes | None = None) -> None:
         self.path = str(path)
         self.store_raw = store_raw
+        self.evidence_key = evidence_key if evidence_key is not None else load_key(os.getenv("AUTOMODE_EVIDENCE_KEY_FILE"))
         self._initialize()
+        self.purge_expired_evidence()
 
     def _connect(self) -> ClosingConnection:
         connection = sqlite3.connect(self.path, timeout=10, factory=ClosingConnection)
@@ -181,11 +245,15 @@ class TraceStore:
                 tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 trace_columns = {row[1] for row in connection.execute("PRAGMA table_info(traces)")} if "traces" in tables else set()
                 stage_columns = {row[1] for row in connection.execute("PRAGMA table_info(classification_stages)")} if "classification_stages" in tables else set()
+                run_columns = {row[1] for row in connection.execute("PRAGMA table_info(classification_runs)")} if "classification_runs" in tables else set()
                 session_columns = {row[1] for row in connection.execute("PRAGMA table_info(sessions)")} if "sessions" in tables else set()
+                alert_columns = {row[1] for row in connection.execute("PRAGMA table_info(alerts)")} if "alerts" in tables else set()
             needs_migration = (
                 (trace_columns and set(TRACE_COLUMNS) - trace_columns)
                 or (stage_columns and set(STAGE_COLUMNS) - stage_columns)
+                or (run_columns and set(RUN_COLUMNS) - run_columns)
                 or (session_columns and set(SESSION_COLUMNS) - session_columns)
+                or (alert_columns and set(ALERT_COLUMNS) - alert_columns)
             )
             if needs_migration:
                 backup = database.with_name(f"{database.name}.pre-automode-migration.bak")
@@ -193,7 +261,7 @@ class TraceStore:
         try:
             with self._connect() as connection:
                 connection.executescript(SCHEMA)
-                for table, columns in (("traces", TRACE_COLUMNS), ("classification_stages", STAGE_COLUMNS), ("sessions", SESSION_COLUMNS)):
+                for table, columns in (("traces", TRACE_COLUMNS), ("classification_stages", STAGE_COLUMNS), ("classification_runs", RUN_COLUMNS), ("sessions", SESSION_COLUMNS), ("alerts", ALERT_COLUMNS)):
                     existing = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
                     for name, definition in columns.items():
                         if name not in existing:
@@ -228,6 +296,10 @@ class TraceStore:
         }
         payload_messages = extract_messages(payload)
         fingerprint = conversation_fingerprint or fingerprint_messages(payload_messages)
+        keyword_policies = self.list_dlp_policies(enabled_only=True)
+        safe_payload = _sanitize_payload(redact_payload(payload, scan_payload(payload, keyword_policies)))
+        latest_value = {"text": latest_user_text}
+        safe_latest = redact_payload(latest_value, scan_payload(latest_value, keyword_policies))["text"]
         with self._connect() as connection:
             session_record_id = _upsert_session(
                 connection,
@@ -261,10 +333,10 @@ class TraceStore:
                     payload.get("model"),
                     session_id,
                     int(bool(payload.get("stream"))),
-                    latest_user_text,
+                    safe_latest,
                     declared_tool_count,
                     json.dumps(safe_headers, ensure_ascii=False),
-                    json.dumps(_sanitize_payload(payload), ensure_ascii=False) if self.store_raw else None,
+                    json.dumps(safe_payload, ensure_ascii=False) if self.store_raw else None,
                     session_record_id,
                     json.dumps(session_evidence or {"status": "missing", "selected": None, "candidates": []}, ensure_ascii=False),
                 ),
@@ -300,13 +372,21 @@ class TraceStore:
             connection.execute(
                 """INSERT INTO classification_runs (
                     id, trace_id, review_transcript_json, final_decision, final_stage, risk,
-                    action_alignment, reason_code, reason, started_at, completed_at, total_latency_ms
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    action_alignment, reason_code, reason, started_at, completed_at, total_latency_ms,
+                    review_object, request_safety, request_purpose, data_findings_json,
+                    destination_json, policy_decision, matched_policies_json, evidence_id, identity_json, semantic_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     run_id, trace_id, json.dumps(result.get("review_transcript", []), ensure_ascii=False),
                     result["final_decision"], result["final_stage"], result["risk"],
                     result["action_alignment"], result["reason_code"], _redact(result["reason"]),
                     started_at, completed_at, float(result.get("total_latency_ms", 0)),
+                    result.get("review_object", "tool_action"), result.get("request_safety", "not_reviewed"),
+                    result.get("request_purpose", "unknown"), json.dumps(result.get("data_findings", []), ensure_ascii=False),
+                    json.dumps(result.get("destination", {}), ensure_ascii=False), result.get("policy_decision", result["final_decision"]),
+                    json.dumps(result.get("matched_policies", []), ensure_ascii=False), result.get("evidence_id"),
+                    json.dumps(result.get("identity", {}), ensure_ascii=False),
+                    result.get("semantic_status", "not_needed"),
                 ),
             )
             for stage in result.get("stages", []):
@@ -363,17 +443,57 @@ class TraceStore:
                 connection.execute(
                     """INSERT INTO alerts (
                         id, trace_id, classification_run_id, session_record_id, created_at, severity,
-                        reason_code, title, reason, evidence_json, actions_json, matched_rules_json, final_stage
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        reason_code, title, reason, evidence_json, actions_json, matched_rules_json, final_stage,
+                        evidence_id, data_findings_json, destination_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         alert_id, trace_id, run_id, session_id, completed_at, result["risk"],
                         result["reason_code"], _alert_title(result), _redact(result["reason"]),
                         json.dumps(result.get("authorization_evidence", []), ensure_ascii=False),
                         json.dumps(result.get("proposed_actions", []), ensure_ascii=False),
-                        json.dumps(result.get("matched_rules", []), ensure_ascii=False), result["final_stage"],
+                        json.dumps(result.get("matched_rules", []), ensure_ascii=False), result["final_stage"], result.get("evidence_id"),
+                        json.dumps(result.get("data_findings", []), ensure_ascii=False),
+                        json.dumps(result.get("destination", {}), ensure_ascii=False),
                     ),
                 )
         return run_id, alert_id
+
+    def record_tool_actions(self, trace_id: str, calls: list[dict[str, Any]]) -> None:
+        """Persist response tool calls as evidence without making them the review object."""
+        actions = [normalize_tool_call(call, source="response").to_dict() for call in calls]
+        if not actions:
+            return
+        created_at = _now()
+        with self._connect() as connection:
+            trace = connection.execute("SELECT session_record_id FROM traces WHERE id=?", (trace_id,)).fetchone()
+            if trace is None:
+                raise KeyError("trace not found")
+            existing = {
+                row[0] for row in connection.execute("SELECT action_hash FROM tool_actions WHERE trace_id=?", (trace_id,))
+            }
+            inserted = 0
+            for action in actions:
+                action_json = json.dumps(action.get("arguments"), ensure_ascii=False, sort_keys=True)
+                action_hash = _sha256(f"{action.get('name')}:{action_json}")
+                if action_hash in existing:
+                    continue
+                connection.execute(
+                    """INSERT INTO tool_actions (
+                        id, trace_id, phase, tool_name, arguments_json, capability, target,
+                        side_effect, risk, action_hash, created_at
+                    ) VALUES (?, ?, 'proposed', ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        str(uuid.uuid4()), trace_id, action.get("name", "unknown"), action_json,
+                        action.get("capability", "unknown"), action.get("target"),
+                        action.get("side_effect"), action.get("risk"), action_hash, created_at,
+                    ),
+                )
+                inserted += 1
+            if inserted and trace["session_record_id"]:
+                connection.execute(
+                    "UPDATE sessions SET tool_call_count=tool_call_count+? WHERE id=?",
+                    (inserted, trace["session_record_id"]),
+                )
 
     def finish(
         self,
@@ -494,6 +614,192 @@ class TraceStore:
         with self._connect() as connection:
             _audit(connection, "rule.rolled_back", "rule", rule_id, {"source_version": version, "new_version": result["version"]})
         return result
+
+    # Shadow DLP target registry -------------------------------------------------
+    def list_destinations(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute("SELECT * FROM destinations ORDER BY updated_at DESC").fetchall()
+        return [{**dict(row), "enabled": bool(row["enabled"])} for row in rows]
+
+    def create_destination(self, value: dict[str, Any]) -> dict[str, Any]:
+        _validate_destination(value)
+        destination_id = str(value.get("id") or uuid.uuid4())
+        now = _now()
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT INTO destinations (
+                    id, name, upstream_pattern, model_pattern, provider, region, trust, enabled, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (destination_id, value["name"], value.get("upstream_pattern", "*"), value.get("model_pattern", "*"),
+                 value.get("provider"), value.get("region"), value["trust"], int(value.get("enabled", True)), now, now),
+            )
+            _audit(connection, "destination.created", "destination", destination_id, {"trust": value["trust"]})
+        return self.get_destination(destination_id) or {}
+
+    def get_destination(self, destination_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM destinations WHERE id=?", (destination_id,)).fetchone()
+        return {**dict(row), "enabled": bool(row["enabled"])} if row else None
+
+    def update_destination(self, destination_id: str, value: dict[str, Any]) -> dict[str, Any]:
+        current = self.get_destination(destination_id)
+        if current is None:
+            raise KeyError("destination not found")
+        merged = {**current, **value}
+        _validate_destination(merged)
+        with self._connect() as connection:
+            connection.execute(
+                """UPDATE destinations SET name=?, upstream_pattern=?, model_pattern=?, provider=?, region=?,
+                   trust=?, enabled=?, updated_at=? WHERE id=?""",
+                (merged["name"], merged.get("upstream_pattern", "*"), merged.get("model_pattern", "*"),
+                 merged.get("provider"), merged.get("region"), merged["trust"], int(merged.get("enabled", True)), _now(), destination_id),
+            )
+            _audit(connection, "destination.updated", "destination", destination_id, {"trust": merged["trust"]})
+        return self.get_destination(destination_id) or {}
+
+    def delete_destination(self, destination_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute("DELETE FROM destinations WHERE id=?", (destination_id,))
+            _audit(connection, "destination.deleted", "destination", destination_id, {})
+
+    # Independent outbound-data policies ---------------------------------------
+    def list_dlp_policies(self, enabled_only: bool = False) -> list[dict[str, Any]]:
+        query = "SELECT * FROM dlp_policies" + (" WHERE enabled=1" if enabled_only else "") + " ORDER BY updated_at DESC"
+        with self._connect() as connection:
+            rows = connection.execute(query).fetchall()
+        return [_dlp_policy_row(row) for row in rows]
+
+    def create_dlp_policy(self, compiled: dict[str, Any], enabled: bool = False) -> dict[str, Any]:
+        _validate_dlp_policy(compiled)
+        policy_id, version, now = str(compiled.get("id") or uuid.uuid4()), 1, _now()
+        value = {**compiled, "id": policy_id, "version": version, "enabled": bool(enabled)}
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO dlp_policies VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (policy_id, value["name"], value["original_text"], version, int(enabled), json.dumps(value, ensure_ascii=False), now, now),
+            )
+            connection.execute(
+                "INSERT INTO dlp_policy_versions VALUES (?, ?, ?, ?, ?, ?)",
+                (str(uuid.uuid4()), policy_id, version, value["original_text"], json.dumps(value, ensure_ascii=False), now),
+            )
+            _audit(connection, "dlp_policy.created", "dlp_policy", policy_id, {"version": version})
+        return self.get_dlp_policy(policy_id) or {}
+
+    def get_dlp_policy(self, policy_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM dlp_policies WHERE id=?", (policy_id,)).fetchone()
+        return _dlp_policy_row(row) if row else None
+
+    def update_dlp_policy(self, policy_id: str, compiled: dict[str, Any]) -> dict[str, Any]:
+        _validate_dlp_policy(compiled)
+        current = self.get_dlp_policy(policy_id)
+        if current is None:
+            raise KeyError("DLP policy not found")
+        version, now = int(current["version"]) + 1, _now()
+        value = {**compiled, "id": policy_id, "version": version, "enabled": current["enabled"]}
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE dlp_policies SET name=?, original_text=?, current_version=?, compiled_json=?, updated_at=? WHERE id=?",
+                (value["name"], value["original_text"], version, json.dumps(value, ensure_ascii=False), now, policy_id),
+            )
+            connection.execute(
+                "INSERT INTO dlp_policy_versions VALUES (?, ?, ?, ?, ?, ?)",
+                (str(uuid.uuid4()), policy_id, version, value["original_text"], json.dumps(value, ensure_ascii=False), now),
+            )
+            _audit(connection, "dlp_policy.updated", "dlp_policy", policy_id, {"version": version})
+        return self.get_dlp_policy(policy_id) or {}
+
+    def set_dlp_policy_enabled(self, policy_id: str, enabled: bool) -> dict[str, Any]:
+        with self._connect() as connection:
+            if connection.execute("SELECT 1 FROM dlp_policies WHERE id=?", (policy_id,)).fetchone() is None:
+                raise KeyError("DLP policy not found")
+            connection.execute("UPDATE dlp_policies SET enabled=?, updated_at=? WHERE id=?", (int(enabled), _now(), policy_id))
+            _audit(connection, "dlp_policy.enabled" if enabled else "dlp_policy.disabled", "dlp_policy", policy_id, {})
+        return self.get_dlp_policy(policy_id) or {}
+
+    def delete_dlp_policy(self, policy_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute("UPDATE dlp_policies SET enabled=0, updated_at=? WHERE id=?", (_now(), policy_id))
+            _audit(connection, "dlp_policy.deleted", "dlp_policy", policy_id, {})
+
+    def dlp_policy_versions(self, policy_id: str) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT version, compiled_json, created_at FROM dlp_policy_versions WHERE policy_id=? ORDER BY version DESC", (policy_id,)
+            ).fetchall()
+        return [{**json.loads(row["compiled_json"]), "created_at": row["created_at"]} for row in rows]
+
+    # Encrypted raw evidence ----------------------------------------------------
+    def store_evidence(self, trace_id: str, payload: dict[str, Any], findings: list[dict[str, Any]], destination: dict[str, Any]) -> str | None:
+        if not findings or self.evidence_key is None:
+            return None
+        evidence_id, created_at = str(uuid.uuid4()), _now()
+        expires_at = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+        raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+        nonce, ciphertext = encrypt_evidence(self.evidence_key, raw, trace_id.encode())
+        categories = sorted({str(item.get("category")) for item in findings})
+        locations = sorted({str(item.get("path")) for item in findings})
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT INTO encrypted_evidence (
+                    id, trace_id, created_at, expires_at, nonce, ciphertext, content_hash,
+                    categories_json, locations_json, destination_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (evidence_id, trace_id, created_at, expires_at, nonce, ciphertext, hashlib.sha256(raw).hexdigest(),
+                 json.dumps(categories), json.dumps(locations), json.dumps(destination, ensure_ascii=False)),
+            )
+        return evidence_id
+
+    def evidence(self, evidence_id: str, *, actor: str, purpose: str, source: str) -> dict[str, Any]:
+        if self.evidence_key is None:
+            raise RuntimeError("evidence encryption key is not configured")
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM encrypted_evidence WHERE id=?", (evidence_id,)).fetchone()
+            if row is None:
+                raise KeyError("evidence not found")
+            if row["expires_at"] <= _now():
+                raise KeyError("evidence expired")
+            plaintext = decrypt_evidence(self.evidence_key, row["nonce"], row["ciphertext"], row["trace_id"].encode())
+            connection.execute(
+                "INSERT INTO evidence_access_log VALUES (?, ?, ?, ?, ?, ?)",
+                (str(uuid.uuid4()), evidence_id, _now(), actor[:200], purpose[:500], source[:200]),
+            )
+        return {
+            "id": evidence_id, "trace_id": row["trace_id"], "created_at": row["created_at"], "expires_at": row["expires_at"],
+            "categories": json.loads(row["categories_json"]), "locations": json.loads(row["locations_json"]),
+            "destination": json.loads(row["destination_json"]), "payload": json.loads(plaintext),
+        }
+
+    def purge_expired_evidence(self) -> int:
+        with self._connect() as connection:
+            deleted = connection.execute("DELETE FROM encrypted_evidence WHERE expires_at<=?", (_now(),)).rowcount
+            _audit(connection, "evidence.purged", "encrypted_evidence", None, {"deleted": deleted})
+        return deleted
+
+    def migrate_legacy_evidence(self) -> dict[str, int]:
+        if self.evidence_key is None:
+            raise RuntimeError("evidence encryption key is not configured")
+        migrated = 0
+        with self._connect() as connection:
+            rows = connection.execute("SELECT id, request_body_json FROM traces WHERE request_body_json IS NOT NULL").fetchall()
+        for row in rows:
+            payload = json.loads(row["request_body_json"])
+            findings = scan_payload(payload)
+            if not findings:
+                continue
+            with self._connect() as connection:
+                exists = connection.execute("SELECT 1 FROM encrypted_evidence WHERE trace_id=?", (row["id"],)).fetchone()
+            if exists:
+                continue
+            evidence_id = self.store_evidence(row["id"], payload, findings, {"trust": "unknown", "name": "legacy"})
+            if evidence_id:
+                with self._connect() as connection:
+                    connection.execute(
+                        "UPDATE traces SET request_body_json=? WHERE id=?",
+                        (json.dumps(redact_payload(payload, findings), ensure_ascii=False), row["id"]),
+                    )
+                migrated += 1
+        return {"scanned": len(rows), "migrated": migrated}
 
     def sessions(
         self,
@@ -751,7 +1057,10 @@ class TraceStore:
                     "stages": [{"stage": stage, "status": "skipped", "verdict": "旧记录无数据", "reason_code": "LEGACY_NO_STAGE_DATA", "reason": "旧记录无数据", "evidence": []} for stage in ("rules", "fast_llm", "deep_llm")],
                 }
             stages = connection.execute("SELECT * FROM classification_stages WHERE run_id=? ORDER BY rowid", (run["id"],)).fetchall()
-        result = _json_row(run, ("review_transcript_json",))
+        result = _json_row(run, (
+            "review_transcript_json", "data_findings_json", "destination_json",
+            "matched_policies_json", "identity_json",
+        ))
         result["stages"] = [_json_row(row, ("matched_rule_ids_json", "matched_rule_versions_json", "evidence_json")) for row in stages]
         return result
 
@@ -791,11 +1100,29 @@ class TraceStore:
             reasons = [{"reason_code": row[0], "count": row[1]} for row in connection.execute("SELECT reason_code, COUNT(*) c FROM alerts GROUP BY reason_code ORDER BY c DESC LIMIT 8")]
             latencies = [float(row[0]) for row in connection.execute("SELECT total_latency_ms FROM classification_runs ORDER BY total_latency_ms")]
             latest_status = connection.execute("SELECT response_status FROM traces WHERE response_status IS NOT NULL ORDER BY created_at DESC LIMIT 1").fetchone()
+            dlp_rows = connection.execute(
+                "SELECT data_findings_json, destination_json, policy_decision FROM classification_runs WHERE review_object='outbound_request'"
+            ).fetchall()
+        category_counts: dict[str, int] = {}
+        destination_counts: dict[str, int] = {}
+        dlp_alerts = 0
+        for row in dlp_rows:
+            for finding in json.loads(row["data_findings_json"] or "[]"):
+                category = str(finding.get("category", "unknown"))
+                category_counts[category] = category_counts.get(category, 0) + 1
+            destination = json.loads(row["destination_json"] or "{}")
+            target = str(destination.get("name") or destination.get("model") or "unregistered")
+            destination_counts[target] = destination_counts.get(target, 0) + 1
+            dlp_alerts += int(row["policy_decision"] == "alert")
         return {
             "trace_count": trace_count, "session_count": session_count, "open_alert_count": alert_count,
             "alert_rate": (decisions.get("alert", 0) / trace_count if trace_count else 0),
             "stage_counts": stages, "decisions": decisions, "top_reasons": reasons,
             "classification_latency_ms": {"p50": _percentile(latencies, 0.50), "p95": _percentile(latencies, 0.95)},
+            "dlp": {
+                "reviewed": len(dlp_rows), "alerts": dlp_alerts,
+                "category_counts": category_counts, "destination_counts": destination_counts,
+            },
             "health": {
                 "gateway": "healthy",
                 "upstream": "healthy" if latest_status and latest_status[0] < 500 else "unknown",
@@ -805,7 +1132,11 @@ class TraceStore:
         }
 
     def settings(self) -> dict[str, Any]:
-        result = {"operating_mode": "observe", "retention_days": 30, "store_raw": self.store_raw}
+        result = {
+            "operating_mode": "observe", "retention_days": 30, "store_raw": self.store_raw,
+            "evidence_encryption_configured": self.evidence_key is not None,
+            "trusted_proxy_cidrs_configured": bool(os.getenv("AUTOMODE_TRUSTED_PROXY_CIDRS")),
+        }
         with self._connect() as connection:
             for row in connection.execute("SELECT key, value_json FROM settings"):
                 if "key" not in row["key"].lower() and "token" not in row["key"].lower():
@@ -1139,9 +1470,42 @@ def _max_risk_sql(connection: sqlite3.Connection, session_id: str, risk: str) ->
 
 
 def _alert_title(result: dict[str, Any]) -> str:
+    if result.get("review_object") == "outbound_request":
+        categories = sorted({str(item.get("category")) for item in result.get("data_findings", [])})
+        return f"{result['risk'].upper()}: outbound {', '.join(categories) or 'data'} requires attention"[:200]
+    if result.get("review_object") == "human_request":
+        return f"{result['risk'].upper()}: human request requires attention"[:200]
     actions = result.get("proposed_actions", [])
     tool = actions[0].get("name") if actions else "Model action"
     return f"{result['risk'].upper()}: {tool} requires attention"[:200]
+
+
+def _validate_destination(value: dict[str, Any]) -> None:
+    if not str(value.get("name") or "").strip():
+        raise ValueError("destination name is required")
+    if value.get("trust") not in {"trusted", "external"}:
+        raise ValueError("destination trust must be trusted or external")
+    for key in ("upstream_pattern", "model_pattern"):
+        if len(str(value.get(key, "*"))) > 500:
+            raise ValueError(f"{key} is too long")
+
+
+def _validate_dlp_policy(value: dict[str, Any]) -> None:
+    if value.get("effect") not in {"alert", "review"}:
+        raise ValueError("DLP policy effect must be alert or review")
+    conditions = value.get("conditions")
+    if not isinstance(conditions, dict):
+        raise ValueError("DLP policy conditions are required")
+    allowed_categories = {"credential", "pii", "source_code", "admin_keyword"}
+    if set(conditions.get("data_categories") or []) - allowed_categories:
+        raise ValueError("unsupported DLP data category")
+    if set(conditions.get("destination_trust") or []) - {"trusted", "external"}:
+        raise ValueError("unsupported destination trust")
+
+
+def _dlp_policy_row(row: sqlite3.Row) -> dict[str, Any]:
+    value = json.loads(row["compiled_json"])
+    return {**value, "id": row["id"], "version": row["current_version"], "enabled": bool(row["enabled"]), "created_at": row["created_at"], "updated_at": row["updated_at"]}
 
 
 def _without_reasoning(value: Any) -> Any:
@@ -1212,7 +1576,7 @@ def _rule_row(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def _alert_row(row: sqlite3.Row) -> dict[str, Any]:
-    return _json_row(row, ("evidence_json", "actions_json", "matched_rules_json"))
+    return _json_row(row, ("evidence_json", "actions_json", "matched_rules_json", "data_findings_json", "destination_json"))
 
 
 def _tool_action_row(row: sqlite3.Row) -> dict[str, Any]:

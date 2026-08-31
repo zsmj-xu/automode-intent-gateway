@@ -5,11 +5,11 @@ build-backend = "hatchling.build"
 [project]
 name = "litellm-auto-intent"
 version = "0.1.0"
-description = "A minimal intent and risk classifier for LiteLLM request logs"
+description = "An enterprise AI outbound Shadow DLP gateway for OpenAI and Anthropic protocols"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
-dependencies = ["aiohttp>=3.9,<4"]
+dependencies = ["aiohttp>=3.9,<4", "cryptography>=42,<47"]
 
 [project.optional-dependencies]
 dev = ["coverage[toml]>=7.6,<8"]

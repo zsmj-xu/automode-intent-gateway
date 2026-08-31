@@ -14,8 +14,9 @@ from urllib.parse import urlsplit, urlunsplit
 from aiohttp import ClientSession, ClientTimeout, web
 from multidict import CIMultiDict
 
-from .admin_api import register_admin_routes
+from .admin_api import ADMIN_TOKEN_KEY, BIND_HOST_KEY, UPSTREAM_KEY, register_admin_routes
 from .classifier import authorization_signals
+from .dlp import evaluate_dlp, trusted_identity
 from .events import EVENT_BROKER_KEY, EventBroker
 from .normalizer import normalize
 from .pipeline import DecisionPipeline
@@ -84,10 +85,47 @@ class Gateway:
 
         inbound_headers = {key.lower(): value for key, value in request.headers.items()}
         trace_id = str(uuid.uuid4())
-        persist_args: dict[str, Any] | None = None
         analysis_payload: dict[str, Any] | None = None
-        persist_task: asyncio.Future[str] | None = None
         self.broker.publish("trace.created", {"id": trace_id, "protocol": protocol, "model": payload.get("model")})
+
+        # Human-request review starts from the request copy, independently of
+        # whether the model later emits a tool call. Persistence and review run
+        # off the forwarding critical path, so Observe mode stays transparent.
+        session_evidence = session_evidence_from(payload, inbound_headers)
+        session_signals: dict[str, Any] | None = None
+        identity = trusted_identity(inbound_headers, request.remote, os.getenv("AUTOMODE_TRUSTED_PROXY_CIDRS"))
+        try:
+            analysis_payload = classification_payload(protocol, payload)
+            normalized = normalize(analysis_payload, source_format_override=protocol)
+            review_context = build_review_context(normalized)
+            latest_user_text = review_context.user_messages[-1] if review_context.user_messages else ""
+            declared_tool_count = len(normalized.tools)
+            session_evidence["fingerprint"] = conversation_fingerprint(normalized.messages)
+            session_signals = authorization_signals(review_context.user_messages)
+            session_signals["statements"] = []
+        except (ValueError, TypeError, KeyError):
+            # Analysis is an observer: malformed-but-upstream-accepted input
+            # must never replace the upstream response with our error.
+            analysis_payload = None
+            latest_user_text = ""
+            declared_tools = payload.get("tools")
+            declared_tool_count = len(declared_tools) if isinstance(declared_tools, list) else 0
+        persist_task = self._enqueue_persistence({
+            "trace_id": trace_id,
+            "protocol": protocol,
+            "method": request.method,
+            "path": request.path_qs,
+            "payload": payload,
+            "headers": inbound_headers,
+            "session_id": session_id_from(payload, inbound_headers),
+            "session_evidence": session_evidence,
+            "conversation_fingerprint": session_evidence.get("fingerprint"),
+            "session_signals": session_signals,
+            "latest_user_text": latest_user_text,
+            "declared_tool_count": declared_tool_count,
+        })
+        if analysis_payload is not None:
+            self._background(self._classify_after_persistence(persist_task, trace_id, analysis_payload, protocol, identity))
 
         upstream_url = _join_url(self.upstream, request.path_qs)
         outbound_headers = _request_headers(request.headers, trace_id)
@@ -99,7 +137,7 @@ class Gateway:
         response_content_type = ""
         response_content_encoding = ""
         error: str | None = None
-        proposed_tool_calls: list[dict[str, Any]] | None = None
+        proposed_tool_calls: list[dict[str, Any]] = []
         pre_upstream_ms = (time.monotonic() - started) * 1000
         try:
             async with self.client.request(
@@ -148,39 +186,6 @@ class Gateway:
             error = type(exc).__name__
             raise web.HTTPBadGateway(text=f"upstream request failed: {error}") from exc
         finally:
-            session_evidence = session_evidence_from(payload, inbound_headers)
-            session_signals: dict[str, Any] | None = None
-            try:
-                analysis_payload = classification_payload(protocol, payload)
-                normalized = normalize(analysis_payload, source_format_override=protocol)
-                review_context = build_review_context(normalized)
-                latest_user_text = review_context.user_messages[-1] if review_context.user_messages else ""
-                declared_tool_count = len(normalized.tools)
-                session_evidence["fingerprint"] = conversation_fingerprint(normalized.messages)
-                session_signals = authorization_signals(review_context.user_messages)
-            except (ValueError, TypeError, KeyError):
-                # Analysis is an observer: a new or malformed-but-upstream-accepted
-                # payload must never replace the upstream response with our error.
-                analysis_payload = None
-                latest_user_text = ""
-                declared_tools = payload.get("tools")
-                declared_tool_count = len(declared_tools) if isinstance(declared_tools, list) else 0
-            persist_args = {
-                "trace_id": trace_id,
-                "protocol": protocol,
-                "method": request.method,
-                "path": request.path_qs,
-                "payload": payload,
-                "headers": inbound_headers,
-                "session_id": session_id_from(payload, inbound_headers),
-                "session_evidence": session_evidence,
-                "conversation_fingerprint": session_evidence.get("fingerprint"),
-                "session_signals": session_signals,
-                "latest_user_text": latest_user_text,
-                "declared_tool_count": declared_tool_count,
-            }
-            if persist_task is None:
-                persist_task = self._enqueue_persistence(persist_args)
             await persist_task
             latency_ms = (time.monotonic() - started) * 1000
             await asyncio.to_thread(
@@ -195,24 +200,42 @@ class Gateway:
                 response_capture_complete=capture_complete,
             )
             self.broker.publish("trace.completed", {"id": trace_id, "status": status, "error": error})
-            if proposed_tool_calls is not None and analysis_payload is not None:
-                self._background(self._classify(trace_id, analysis_payload, protocol, proposed_tool_calls))
+            try:
+                await asyncio.to_thread(self.store.record_tool_actions, trace_id, proposed_tool_calls)
+            except Exception:
+                # Response-action evidence is secondary and must not affect the proxy.
+                pass
 
-    async def _classify(
+    async def _classify_after_persistence(
+        self,
+        persist_task: asyncio.Future[str],
+        trace_id: str,
+        payload: dict[str, Any],
+        protocol: str,
+        identity: dict[str, Any],
+    ) -> None:
+        await persist_task
+        await self._classify_dlp(trace_id, payload, protocol, identity)
+
+    async def _classify_dlp(
         self,
         trace_id: str,
         payload: dict[str, Any],
         protocol: str,
-        proposed_tool_calls: list[dict[str, Any]],
+        identity: dict[str, Any],
     ) -> None:
         try:
-            normalized = normalize(payload, source_format_override=protocol)
-            active_rules = await asyncio.to_thread(self.store.enabled_rules)
-            session_baseline = await asyncio.to_thread(self.store.session_baseline_for_trace, trace_id)
-            pipeline_result = await asyncio.to_thread(
-                DecisionPipeline().classify, normalized, proposed_tool_calls, active_rules, session_baseline
+            targets, policies = await asyncio.gather(
+                asyncio.to_thread(self.store.list_destinations),
+                asyncio.to_thread(self.store.list_dlp_policies, True),
             )
-            result = pipeline_result.to_dict()
+            result = await asyncio.to_thread(
+                evaluate_dlp, payload, protocol=protocol, upstream=self.upstream,
+                identity=identity, targets=targets, policies=policies,
+            )
+            result["evidence_id"] = await asyncio.to_thread(
+                self.store.store_evidence, trace_id, payload, result["data_findings"], result["destination"]
+            )
             run_id, alert_id = await asyncio.to_thread(self.store.save_pipeline, trace_id, result)
             for stage in result["stages"]:
                 self.broker.publish(f"classification.{stage['stage'].replace('_llm', '')}.completed", {"trace_id": trace_id, "run_id": run_id, "stage": stage["stage"], "status": stage["status"], "verdict": stage["verdict"]})
@@ -292,6 +315,9 @@ def create_app(
     app[GATEWAY_KEY] = gateway
     app[TRACE_STORE_KEY] = store
     app[EVENT_BROKER_KEY] = broker
+    app[ADMIN_TOKEN_KEY] = token
+    app[BIND_HOST_KEY] = bind_host
+    app[UPSTREAM_KEY] = gateway.upstream
     app.on_startup.append(gateway.start)
     app.on_cleanup.append(gateway.stop)
     app.router.add_get("/health", _health)

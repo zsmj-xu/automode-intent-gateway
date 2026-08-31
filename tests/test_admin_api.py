@@ -9,6 +9,7 @@ from aiohttp import ClientSession, web
 from aiohttp.test_utils import TestServer
 
 from automode_gateway.events import EVENT_BROKER_KEY
+from automode_gateway.evidence import generate_key
 from automode_gateway.gateway import TRACE_STORE_KEY, create_app
 
 
@@ -74,13 +75,32 @@ class AdminApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse((await response.json())["enabled"])
         async with self.client.delete(self.server.make_url(f"/api/rules/{rule['id']}")) as response:
             self.assertEqual(response.status, 204)
-        async with self.client.get(self.server.make_url("/api/rules")) as response:
+
+    async def test_dlp_destination_policy_compile_test_and_version_routes(self):
+        async with self.client.post(self.server.make_url("/api/destinations"), json={
+            "name": "Internal Models", "upstream_pattern": "*", "model_pattern": "corp-*", "trust": "trusted", "provider": "internal", "region": "cn",
+        }) as response:
+            self.assertEqual(response.status, 201)
+            target = await response.json()
+        async with self.client.get(self.server.make_url("/api/destinations")) as response:
+            self.assertEqual((await response.json())["data"][0]["id"], target["id"])
+
+        async with self.client.post(self.server.make_url("/api/dlp-policies/compile"), json={"text": "凭据发往外部模型时告警"}) as response:
+            preview = await response.json()
+        self.assertTrue(preview["valid"])
+        async with self.client.post(self.server.make_url("/api/dlp-policies"), json={"compiled": preview["compiled"], "enabled": True}) as response:
+            self.assertEqual(response.status, 201)
+            policy = await response.json()
+        async with self.client.post(self.server.make_url("/api/dlp-policies/test"), json={
+            "payload": {"model": "external-model", "messages": [{"role": "user", "content": "password=hunter2"}]}
+        }) as response:
+            result = await response.json()
+        self.assertEqual(result["policy_decision"], "alert")
+        self.assertEqual(result["data_findings"][0]["category"], "credential")
+        async with self.client.get(self.server.make_url(f"/api/dlp-policies/{policy['id']}/versions")) as response:
             self.assertEqual(len((await response.json())["data"]), 1)
-
-        async with self.client.post(self.server.make_url("/api/rules/compile"), json={"text": "模糊处理一下"}) as response:
-            self.assertEqual(response.status, 422)
-            self.assertEqual((await response.json())["errors"][0]["field"], "conditions")
-
+        async with self.client.post(self.server.make_url(f"/api/dlp-policies/{policy['id']}/disable"), json={}) as response:
+            self.assertFalse((await response.json())["enabled"])
     async def test_playground_and_settings_never_return_credentials(self):
         body = {
             "protocol": "openai_chat_completions",
@@ -101,7 +121,8 @@ class AdminApiTests(unittest.IsolatedAsyncioTestCase):
         body["proposed_tool_calls"] = [{"name": "git_push", "arguments": {}}]
         async with self.client.post(self.server.make_url("/api/playground/classify"), json=body) as response:
             rules_only = await response.json()
-        self.assertEqual(rules_only["final_decision"], "alert")
+        self.assertEqual(rules_only["final_decision"], "allow")
+        self.assertEqual(rules_only["review_object"], "outbound_request")
         self.assertEqual(len(rules_only["stages"]), 1)
         async with self.client.get(self.server.make_url("/api/settings")) as response:
             value = await response.json()
@@ -252,6 +273,31 @@ class AdminAuthTests(unittest.IsolatedAsyncioTestCase):
                 async with client.get(server.make_url("/api/settings"), headers={"x-automode-admin-token": "admin-secret"}) as response:
                     self.assertEqual(response.status, 200)
             await server.close()
+
+    async def test_raw_evidence_requires_admin_token_and_loopback_and_is_audited(self):
+        with tempfile.TemporaryDirectory() as directory:
+            key_path = Path(directory) / "evidence.key"
+            key_path.write_text(generate_key(), encoding="ascii")
+            os.chmod(key_path, 0o600)
+            os.environ["AUTOMODE_EVIDENCE_KEY_FILE"] = str(key_path)
+            try:
+                app = create_app("http://127.0.0.1:9", str(Path(directory) / "evidence.db"), bind_host="127.0.0.1", admin_token="admin-secret")
+                store = app[TRACE_STORE_KEY]
+                payload = {"model": "m", "messages": [{"role": "user", "content": "password=hunter2"}]}
+                trace_id = store.create(protocol="openai_chat_completions", method="POST", path="/v1/chat/completions", payload=payload, headers={}, session_id=None, latest_user_text="password=hunter2", declared_tool_count=0)
+                from automode_gateway.dlp import scan_payload
+                evidence_id = store.store_evidence(trace_id, payload, scan_payload(payload), {"trust": "external"})
+                server = TestServer(app)
+                await server.start_server()
+                async with ClientSession() as client:
+                    async with client.get(server.make_url(f"/api/evidence/{evidence_id}/raw")) as response:
+                        self.assertEqual(response.status, 401)
+                    async with client.get(server.make_url(f"/api/evidence/{evidence_id}/raw"), headers={"x-automode-admin-token": "admin-secret"}) as response:
+                        self.assertEqual(response.status, 200)
+                        self.assertEqual((await response.json())["payload"], payload)
+                await server.close()
+            finally:
+                os.environ.pop("AUTOMODE_EVIDENCE_KEY_FILE", None)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Activity, ChevronRight, Search, SlidersHorizontal, X } from 'lucide-react'
+import { Activity, AlertTriangle, ChevronRight, RefreshCw, Search, ShieldAlert, SlidersHorizontal, User, X } from 'lucide-react'
 import type { Alert, Json, Session, SessionDetail, TraceDetail } from '../types'
 import { useLoad } from '../lib/hooks'
 import { formatTime, sessionTitle, truncate } from '../lib/format'
@@ -27,6 +27,7 @@ export function Sessions({ refresh }: { refresh: number }) {
   const [showFilters, setShowFilters] = useState(false)
   const [selected, setSelected] = useState<string | null>(initial.get('session') || null)
   const [backfilling, setBackfilling] = useState(false)
+  const [showBackfillConfirm, setShowBackfillConfirm] = useState(false)
   const [backfillResult, setBackfillResult] = useState('')
   const [localRefresh, setLocalRefresh] = useState(0)
 
@@ -48,6 +49,7 @@ export function Sessions({ refresh }: { refresh: number }) {
   const activeFilters = Object.entries(filters).filter(([, value]) => value)
 
   async function backfill() {
+    setShowBackfillConfirm(false)
     setBackfilling(true)
     setBackfillResult('')
     try {
@@ -68,10 +70,22 @@ export function Sessions({ refresh }: { refresh: number }) {
   return (
     <div className="sessions-page">
       <section className="session-intro">
-        <div><p className="eyebrow">AUDIT TIMELINE</p><h2>会话审计</h2><p>先选一个工作上下文，右侧按时间线查看每次调用、拟执行工具、判定瀑布与证据。</p></div>
+        <div><p className="eyebrow">SHADOW DLP TIMELINE</p><h2>出站请求审计</h2><p>按人的用途、敏感数据、模型目标和策略结论调查每次调用；Observe 模式不阻断。</p></div>
         <div className="session-count">
           <strong>{visibleRows.length}</strong><span>个匹配上下文</span>
-          <button className="secondary compact" disabled={backfilling} onClick={backfill}>{backfilling ? '重建中…' : '重建历史会话分组'}</button>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            {!showBackfillConfirm ? (
+              <button className="secondary compact" disabled={backfilling} onClick={() => setShowBackfillConfirm(true)}>
+                {backfilling ? '重建中…' : '重建历史会话分组'}
+              </button>
+            ) : (
+              <div style={{ display: 'flex', alignItems: 'center', gap: '6px', background: '#1c1512', border: '1px solid #7b5c2e', padding: '3px 8px', borderRadius: '6px' }}>
+                <span style={{ fontSize: '11px', color: '#f1c879' }}>确认重新计算全部历史分组？</span>
+                <button className="primary compact" onClick={backfill}>确认</button>
+                <button className="secondary compact" onClick={() => setShowBackfillConfirm(false)}>取消</button>
+              </div>
+            )}
+          </div>
           {backfillResult && <span className="backfill-result">{backfillResult}</span>}
         </div>
       </section>
@@ -102,27 +116,65 @@ export function Sessions({ refresh }: { refresh: number }) {
           )}
           {visibleRows.length ? (
             <div className="session-list">
-              {visibleRows.map(row => (
-                <button key={row.id} aria-pressed={selected === row.id} className={selected === row.id ? 'session-row selected' : 'session-row'} onClick={() => setSelected(row.id)}>
-                  <div className="session-primary">
-                    <b>{sessionTitle(row.external_session_id)}</b>
-                    <span><span className="source-badge">{row.client_type || 'unknown'}</span>{row.models?.join(', ') || '未知模型'}</span>
-                    {row.authorization && (row.authorization.capabilities?.length || row.authorization.forbidden_capabilities?.length) ? (
-                      <span className="session-auth-summary">
-                        {row.authorization.capabilities?.length ? <span className="granted">授权{row.authorization.capabilities.map((cap: string) => <CapabilityBadge key={cap} capability={cap} />)}</span> : null}
-                        {row.authorization.forbidden_capabilities?.length ? <span className="forbidden">禁止{row.authorization.forbidden_capabilities.map((cap: string) => <CapabilityBadge key={cap} capability={cap} />)}</span> : null}
+              {visibleRows.map(row => {
+                const hasAlert = row.alert_count > 0
+                return (
+                  <button
+                    key={row.id}
+                    aria-pressed={selected === row.id}
+                    className={selected === row.id ? 'session-row selected' : 'session-row'}
+                    onClick={() => setSelected(row.id)}
+                  >
+                    <div className="session-row-head">
+                      <div className="session-title-wrap">
+                        <b className="session-title" title={sessionTitle(row.external_session_id)}>
+                          {sessionTitle(row.external_session_id)}
+                        </b>
+                        {hasAlert && <span className="session-alert-tag">告警</span>}
+                      </div>
+                      <Risk level={row.max_risk} />
+                    </div>
+
+                    <div className="session-row-meta">
+                      <span className="source-badge">{row.client_type || 'unknown'}</span>
+                      <span className="session-model" title={row.models?.join(', ') || '未知模型'}>
+                        {row.models?.join(', ') || '未知模型'}
                       </span>
+                      <span className="session-count-tag">{row.call_count} 次请求</span>
+                    </div>
+
+                    {row.authorization && (row.authorization.capabilities?.length || row.authorization.forbidden_capabilities?.length) ? (
+                      <div className="session-auth-summary">
+                        {row.authorization.capabilities?.length ? (
+                          <span className="granted">
+                            <small>能力</small>
+                            {row.authorization.capabilities.map((cap: string) => (
+                              <CapabilityBadge key={cap} capability={cap} />
+                            ))}
+                          </span>
+                        ) : null}
+                        {row.authorization.forbidden_capabilities?.length ? (
+                          <span className="forbidden">
+                            <small>禁止</small>
+                            {row.authorization.forbidden_capabilities.map((cap: string) => (
+                              <CapabilityBadge key={cap} capability={cap} />
+                            ))}
+                          </span>
+                        ) : null}
+                      </div>
                     ) : null}
-                  </div>
-                  <div className="session-stat"><Risk level={row.max_risk} /><span>{row.call_count} 次请求</span></div>
-                  <span className="session-time">{formatTime(row.last_seen_at)}</span>
-                  <ChevronRight size={17} />
-                </button>
-              ))}
+
+                    <div className="session-row-foot">
+                      <span className="session-time">{formatTime(row.last_seen_at)}</span>
+                      <ChevronRight size={14} className="session-chevron" />
+                    </div>
+                  </button>
+                )
+              })}
             </div>
           ) : <Empty text="当前筛选条件下没有会话" />}
         </section>
-        {selected ? <SessionDetail id={selected} refresh={refresh} onClose={() => setSelected(null)} /> : <section className="panel detail-empty"><Activity size={30} /><h2>选择一个会话</h2><p>查看用户输入、工具动作与三级判定瀑布。</p></section>}
+        {selected ? <SessionDetail id={selected} refresh={refresh} onClose={() => setSelected(null)} /> : <section className="panel detail-empty"><Activity size={30} /><h2>选择一个会话</h2><p>查看出站数据合规判定与模型动作旁证。</p></section>}
       </div>
     </div>
   )
@@ -171,16 +223,16 @@ function SessionDetail({ id, refresh, onClose }: { id: string; refresh: number; 
 function SessionBaseline({ authorization }: { authorization: Json }) {
   return (
     <div className="session-baseline">
-      <div className="session-baseline-head"><b>会话授权基线</b><span>累积自本会话用户输入，约束后续所有轮次的审核</span></div>
+      <div className="session-baseline-head"><b>历史用途摘要（旁证）</b><span>从脱敏用户输入累计，不替代本轮出站数据策略结论</span></div>
       <div className="session-baseline-body">
         {authorization.capabilities?.length ? (
-          <div className="evidence"><b>已授权能力</b>{authorization.capabilities.map((cap: string) => <CapabilityBadge key={cap} capability={cap} />)}</div>
+          <div className="evidence"><b>请求过的能力</b>{authorization.capabilities.map((cap: string) => <CapabilityBadge key={cap} capability={cap} />)}</div>
         ) : null}
         {authorization.forbidden_capabilities?.length ? (
           <div className="evidence"><b>禁止能力</b>{authorization.forbidden_capabilities.map((cap: string) => <CapabilityBadge key={cap} capability={cap} />)}</div>
         ) : null}
         {authorization.statements?.length ? (
-          <div className="evidence statements"><b>授权依据</b>{authorization.statements.map((item: Json) => <span key={item.text}>{item.text}</span>)}</div>
+          <div className="evidence statements"><b>历史原文</b>{authorization.statements.map((item: Json) => <span key={item.text}>{item.text}</span>)}</div>
         ) : null}
       </div>
     </div>
@@ -191,24 +243,146 @@ function TraceCard({ trace, index, allExpanded, refresh }: { trace: TraceDetail;
   const [open, setOpen] = useState<'waterfall' | 'context' | 'raw' | null>(allExpanded ? 'waterfall' : null)
   useEffect(() => setOpen(allExpanded ? 'waterfall' : null), [allExpanded])
   const classification = trace.classification
-  const decision = classification?.final_decision || (trace.tool_actions.length ? '分类中' : '无需分类')
+  const decision = classification?.final_decision || '分类中'
   const risk = classification?.risk || 'low'
+
+  const stages = classification?.stages || []
+  const rulesStage = stages.find(s => s.stage === 'rules')
+  const deepStage = stages.find(s => s.stage === 'deep_llm')
+
+  // 收集所有匹配到的规则/策略名称（去重）
+  const matchedRules = Array.from(new Set([
+    ...(trace.alerts.flatMap(a => a.matched_rules || [])),
+    ...(classification?.matched_rules || []),
+    ...(classification?.matched_policies || []),
+    ...(rulesStage?.matched_rule_versions || []),
+  ])).filter(Boolean)
+
+  const hasAlert = trace.alerts.length > 0 || decision === 'alert'
+
   return (
     <article className="trace-card">
       <div className="turn-summary">
-        <div><span className="turn-label">#{index} · REQUEST {truncate(trace.trace_id, 8)}</span><strong className={`decision-badge ${decision === 'allow' ? 'allow' : decision === 'alert' ? 'alert' : 'pending'}`}>{decision}</strong><span>{formatTime(trace.created_at)}</span></div>
+        <div>
+          <span className="turn-label">#{index} · REQUEST {truncate(trace.trace_id, 8)}</span>
+          <strong className={`decision-badge ${decision === 'allow' ? 'allow' : decision === 'alert' ? 'alert' : 'pending'}`}>{decision}</strong>
+          <span>{formatTime(trace.created_at)}</span>
+        </div>
         <Risk level={risk} />
       </div>
+
       {trace.session_evidence && (
-        <div className="session-evidence"><span>Session</span><b>{trace.session_evidence.status === 'provided' ? '客户端提供' : '未提供'}</b><code>{trace.session_evidence.selected ? `${trace.session_evidence.selected.field}: ${trace.session_evidence.selected.value}` : '无 session_id · 请求级记录'}</code>{trace.session_evidence.fingerprint ? <code className="fingerprint">指纹 {truncate(String(trace.session_evidence.fingerprint), 10)}</code> : null}</div>
+        <div className="session-evidence">
+          <span>Session</span>
+          <b>{trace.session_evidence.status === 'provided' ? '客户端提供' : '未提供'}</b>
+          <code>{trace.session_evidence.selected ? `${trace.session_evidence.selected.field}: ${trace.session_evidence.selected.value}` : '无 session_id · 请求级记录'}</code>
+          {trace.session_evidence.fingerprint ? <code className="fingerprint">指纹 {truncate(String(trace.session_evidence.fingerprint), 10)}</code> : null}
+        </div>
       )}
+
+      {/* 【置顶重点】1. 告警详情与规则判定置顶卡片 */}
+      {hasAlert && (
+        <div className="trace-alert-card">
+          <div className="trace-alert-card-head">
+            <div className="trace-alert-card-title">
+              <ShieldAlert size={18} className="alert-icon" />
+              <b>告警与合规判定详情</b>
+              <span className={`risk-tag-high ${risk}`}>{risk.toUpperCase()} RISK</span>
+            </div>
+            {trace.alerts.length > 0 && <span className="alert-count-pill">{trace.alerts.length} 条关联告警</span>}
+          </div>
+
+          <div className="trace-risk-reasons">
+            {/* 确定性规则判定为什么认为有风险 */}
+            <div className="risk-reason-item">
+              <span className="reason-label">确定性规则判定</span>
+              <div className="reason-content">
+                <b>{rulesStage ? `${rulesStage.verdict} · ${rulesStage.reason_code}` : (classification?.reason_code || 'RISKY')}</b>
+                <p>
+                  {rulesStage?.reason || classification?.reason || (
+                    rulesStage?.reason_code === 'ACTION_OUTSIDE_EXPLICIT_SCOPE'
+                      ? '拟调用的工具动作超出会话已授权的显式范围'
+                      : rulesStage?.reason_code === 'USER_CONSTRAINT'
+                      ? '拟调用的工具动作违反了用户在上下文中明确声明的禁止约束'
+                      : '检测到动作风险或敏感数据出站'
+                  )}
+                </p>
+              </div>
+            </div>
+
+            {/* 审查模型介入/异常原因（如有） */}
+            {deepStage && (deepStage.status === 'error' || deepStage.verdict === 'reject') && (
+              <div className="risk-reason-item warning">
+                <span className="reason-label">后置审查模型</span>
+                <div className="reason-content">
+                  <b>{deepStage.stage}: {deepStage.reason_code} ({deepStage.status})</b>
+                  <p>
+                    {deepStage.status === 'error'
+                      ? '审查模型不可用或响应超时；系统基于安全保守原则（Fail-Closed）禁止未知放行，直接判定为高风险告警。'
+                      : deepStage.reason || '审查模型判定该行为存在违规风险。'}
+                  </p>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* 匹配到的告警规则/策略 */}
+          {matchedRules.length > 0 && (
+            <div className="trace-matched-rules">
+              <span className="rules-label">🎯 匹配到的告警规则/策略：</span>
+              <div className="rules-list">
+                {matchedRules.map((ruleName, idx) => (
+                  <span key={idx} className="rule-badge">{ruleName}</span>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* 关联告警处置项 */}
+          {trace.alerts.length > 0 && (
+            <div className="trace-alert-instances">
+              {trace.alerts.map(alert => <InlineAlert key={alert.id} alert={alert} refresh={refresh} />)}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* 出站数据合规汇总（若是 outbound_request） */}
+      {classification?.review_object === 'outbound_request' && (
+        <div className="dlp-decision-card" aria-label="出站数据合规结论">
+          <div><span>人的用途</span><b>{classification.request_purpose || 'unknown'}</b></div>
+          <div><span>敏感发现</span><b>{classification.data_findings?.length || 0}</b></div>
+          <div><span>模型目标</span><b>{classification.destination?.name || trace.model || '未注册'}</b><StatusPill status={classification.destination?.trust || 'external'} /></div>
+          <div><span>策略结论</span><strong className={`decision-badge ${classification.policy_decision}`}>{classification.policy_decision}</strong></div>
+          {!!classification.data_findings?.length && (
+            <div className="dlp-findings">
+              {classification.data_findings.map((finding, index) => <span key={`${finding.path}-${index}`}><code>{finding.category}</code>{finding.path} · {finding.detector}</span>)}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* 判定瀑布流水线 */}
+      {classification && (
+        <div className="trace-section">
+          <div className="trace-section-head">
+            <b>出站数据合规判定 (RULES → FAST → DEEP)</b>
+            <button className="text-button" onClick={() => setOpen(open === 'waterfall' ? null : 'waterfall')}>{open === 'waterfall' ? '收起' : '展开'}</button>
+          </div>
+          {open === 'waterfall' && <DecisionWaterfall classification={classification} />}
+        </div>
+      )}
+
+      {/* 【下层细节】用户输入 */}
       <div className="trace-section">
         <div className="trace-section-head"><b>用户输入</b><span>{trace.latest_user_text ? '最新消息' : '无可解析输入'}</span></div>
         <div className="user-bubble">{trace.latest_user_text || JSON.stringify(trace.request_body || {})}</div>
       </div>
+
+      {/* 【下层细节】模型动作旁证 */}
       {trace.tool_actions.length > 0 && (
         <div className="trace-section">
-          <div className="trace-section-head"><b>拟调用工具</b><span>{trace.tool_actions.length} 个动作</span></div>
+          <div className="trace-section-head"><b>模型动作旁证</b><span>{trace.tool_actions.length} 个动作</span></div>
           {trace.tool_actions.map((action, index) => (
             <div className="tool-action" key={index}>
               <div className="tool-action-head"><b>{action.tool_name}</b><CapabilityBadge capability={action.capability} />{action.target && <span className="tool-target">{action.target}</span>}</div>
@@ -217,30 +391,18 @@ function TraceCard({ trace, index, allExpanded, refresh }: { trace: TraceDetail;
           ))}
         </div>
       )}
+
+      {/* 【下层细节】审查上下文 */}
       {classification && (
-        <>
-          <div className="trace-section">
-            <div className="trace-section-head">
-              <b>判定瀑布</b>
-              <button className="text-button" onClick={() => setOpen(open === 'waterfall' ? null : 'waterfall')}>{open === 'waterfall' ? '收起' : '展开'}</button>
-            </div>
-            {open === 'waterfall' && <DecisionWaterfall classification={classification} />}
-          </div>
-          <div className="trace-section">
-            <div className="trace-section-head">
-              <b>审查上下文（分类器实际看到的内容）</b>
-              <button className="text-button" onClick={() => setOpen(open === 'context' ? null : 'context')}>{open === 'context' ? '收起' : '展开'}</button>
-            </div>
-            {open === 'context' && <ReviewContext transcript={classification.review_transcript} />}
-          </div>
-        </>
-      )}
-      {trace.alerts.length > 0 && (
         <div className="trace-section">
-          <div className="trace-section-head"><b>关联告警</b><span>{trace.alerts.length} 条</span></div>
-          {trace.alerts.map(alert => <InlineAlert key={alert.id} alert={alert} refresh={refresh} />)}
+          <div className="trace-section-head">
+            <b>审查上下文（分类器实际看到的内容）</b>
+            <button className="text-button" onClick={() => setOpen(open === 'context' ? null : 'context')}>{open === 'context' ? '收起' : '展开'}</button>
+          </div>
+          {open === 'context' && <ReviewContext transcript={classification.review_transcript} />}
         </div>
       )}
+
       <details className="raw-payload"><summary>查看原始 Input / Output JSON</summary><div className="raw-grid"><pre>{JSON.stringify(trace.request_body, null, 2)}</pre><pre>{JSON.stringify(trace.response_body, null, 2)}</pre></div></details>
     </article>
   )
@@ -252,14 +414,24 @@ function InlineAlert({ alert, refresh }: { alert: Alert; refresh: number }) {
     const updated = await patch<Alert>(`/api/alerts/${alert.id}`, { status })
     setLocal(updated)
   }
+  const cleanTitle = local.title.replace(/^(HIGH|MEDIUM|LOW|CRITICAL):\s*/i, '')
   return (
     <div className="inline-alert">
-      <div className="inline-alert-head"><Risk level={local.severity} /><b>{local.title}</b><code>{local.reason_code}</code><StatusPill status={local.status} /></div>
+      <div className="inline-alert-head">
+        <Risk level={local.severity} />
+        <b>{cleanTitle}</b>
+        <code>{local.reason_code}</code>
+        <StatusPill status={local.status} />
+      </div>
       <p>{local.reason}</p>
       {local.evidence?.length > 0 && <div className="evidence"><b>证据</b>{local.evidence.map(line => <span key={line}>{line}</span>)}</div>}
       {local.matched_rules?.length > 0 && <div className="evidence"><b>命中规则</b>{local.matched_rules.map(line => <code key={line}>{line}</code>)}</div>}
       <div className="inline-alert-actions">
-        {(['acknowledged', 'false_positive', 'resolved', 'open'] as const).filter(status => status !== local.status).map(status => <button key={status} className="secondary compact" onClick={() => setStatus(status)}>{status}</button>)}
+        {(['acknowledged', 'false_positive', 'resolved', 'open'] as const).filter(status => status !== local.status).map(status => (
+          <button key={status} className="secondary compact" onClick={() => setStatus(status)}>
+            {status === 'open' ? '重新开放' : status === 'acknowledged' ? '确认' : status === 'false_positive' ? '标记误报' : '解决'}
+          </button>
+        ))}
       </div>
     </div>
   )

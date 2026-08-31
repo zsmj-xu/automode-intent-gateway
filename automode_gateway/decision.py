@@ -45,6 +45,8 @@ class PipelineResult:
     stages: list[StageResult]
     total_latency_ms: float
     review_transcript: list[dict[str, Any]]
+    review_object: str = "tool_action"
+    request_safety: str = "not_reviewed"
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)

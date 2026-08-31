@@ -36,6 +36,11 @@ def _parser() -> argparse.ArgumentParser:
 
     backfill_cmd = sub.add_parser("backfill", help="regroup historical traces into conversation sessions")
     backfill_cmd.add_argument("--db", default=os.getenv("AUTOMODE_DB", "automode.db"))
+    key_cmd = sub.add_parser("evidence-key", help="generate a local AES-256 evidence key file")
+    key_cmd.add_argument("path", help="new key file path")
+    migrate_cmd = sub.add_parser("migrate-evidence", help="encrypt sensitive historical request bodies and replace them with redacted copies")
+    migrate_cmd.add_argument("--db", default=os.getenv("AUTOMODE_DB", "automode.db"))
+    migrate_cmd.add_argument("--key-file", required=True)
     return parser
 
 
@@ -51,6 +56,26 @@ def main() -> None:
         from .storage import TraceStore
 
         stats = TraceStore(args.db).backfill_sessions()
+        print(json.dumps(stats, ensure_ascii=False, indent=2))
+        return
+
+    if args.command == "evidence-key":
+        from .evidence import generate_key
+
+        path = Path(args.path)
+        if path.exists():
+            raise SystemExit(f"refusing to overwrite existing key file: {path}")
+        path.touch(mode=0o600, exist_ok=False)
+        path.write_text(generate_key() + "\n", encoding="ascii")
+        os.chmod(path, 0o600)
+        print(str(path.resolve()))
+        return
+
+    if args.command == "migrate-evidence":
+        from .evidence import load_key
+        from .storage import TraceStore
+
+        stats = TraceStore(args.db, evidence_key=load_key(args.key_file)).migrate_legacy_evidence()
         print(json.dumps(stats, ensure_ascii=False, indent=2))
         return
 

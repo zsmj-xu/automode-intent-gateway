@@ -1,22 +1,30 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
+import ipaddress
 import json
 from typing import Any
 
 from aiohttp import web
 
 from .events import EVENT_BROKER_KEY
+from .dlp import evaluate_dlp
+from .dlp_rule_compiler import DLPPolicyCompileError, compile_dlp_policy
 from .llm_classifier import LLMClassifier, ReviewerSettings
 from .normalizer import normalize
 from .pipeline import DecisionPipeline
 from .policy import evaluate_rules
 from .protocols import classification_payload
 from .rule_compiler import RuleCompileError, compile_preview
+from .review_context import build_review_context
 from .storage import TraceStore
 
 
 STORE_KEY = web.AppKey("admin_trace_store", TraceStore)
+ADMIN_TOKEN_KEY = web.AppKey("admin_token", object)
+BIND_HOST_KEY = web.AppKey("bind_host", str)
+UPSTREAM_KEY = web.AppKey("upstream", str)
 
 
 def register_admin_routes(app: web.Application, store: TraceStore) -> None:
@@ -51,6 +59,21 @@ def register_admin_routes(app: web.Application, store: TraceStore) -> None:
     routes.add_patch("/api/settings", update_settings)
     routes.add_post("/api/settings/test-fast-model", test_fast)
     routes.add_post("/api/settings/test-deep-model", test_deep)
+    routes.add_get("/api/destinations", destinations)
+    routes.add_post("/api/destinations", create_destination)
+    routes.add_patch("/api/destinations/{destination_id}", update_destination)
+    routes.add_delete("/api/destinations/{destination_id}", delete_destination)
+    routes.add_get("/api/dlp-policies", dlp_policies)
+    routes.add_post("/api/dlp-policies/compile", compile_dlp)
+    routes.add_post("/api/dlp-policies/test", test_dlp)
+    routes.add_post("/api/dlp-policies", create_dlp_policy)
+    routes.add_patch("/api/dlp-policies/{policy_id}", update_dlp_policy)
+    routes.add_delete("/api/dlp-policies/{policy_id}", delete_dlp_policy)
+    routes.add_post("/api/dlp-policies/{policy_id}/enable", enable_dlp_policy)
+    routes.add_post("/api/dlp-policies/{policy_id}/disable", disable_dlp_policy)
+    routes.add_get("/api/dlp-policies/{policy_id}/versions", dlp_policy_versions)
+    routes.add_get("/api/evidence/{evidence_id}/raw", raw_evidence)
+    routes.add_post("/api/evidence/purge", purge_evidence)
 
 
 async def dashboard(request: web.Request) -> web.Response:
@@ -240,36 +263,25 @@ async def playground_classify(request: web.Request) -> web.Response:
     body = await _json(request)
     protocol = str(body.get("protocol", "openai_chat_completions"))
     payload = body.get("payload") or body
-    proposed = body.get("proposed_tool_calls") or []
-    analysis = classification_payload(protocol, payload)
-    normalized = normalize(analysis, source_format_override=protocol)
-    active_rules = await _store_call(request, "enabled_rules")
-    temporary_rule = body.get("temporary_rule")
-    if isinstance(temporary_rule, dict):
-        active_rules = [*active_rules, {**temporary_rule, "id": "temporary", "version": 0}]
-    if body.get("stage") == "rules":
-        rule_stage, baseline = evaluate_rules(normalized, proposed, active_rules)
-        return web.json_response({
-            "final_decision": "allow" if rule_stage.verdict == "SAFE" else "alert",
-            "final_stage": "rules", "risk": rule_stage.risk,
-            "action_alignment": rule_stage.action_alignment, "reason_code": rule_stage.reason_code,
-            "reason": rule_stage.reason, "proposed_actions": baseline.get("proposed_tool_calls", []),
-            "review_transcript": baseline.get("review_transcript", []), "stages": [rule_stage.to_dict()],
-        })
-    result = await asyncio.to_thread(DecisionPipeline().classify, normalized, proposed, active_rules)
-    return web.json_response(result.to_dict())
+    result = await asyncio.to_thread(
+        evaluate_dlp, payload, protocol=protocol, upstream=request.app[UPSTREAM_KEY],
+        identity={"trusted": False, "roles": []}, targets=await _store_call(request, "list_destinations"),
+        policies=await _store_call(request, "list_dlp_policies", True),
+    )
+    return web.json_response(result)
 
 
 async def replay(request: web.Request) -> web.Response:
     trace = await _store_call(request, "get", request.match_info["trace_id"])
     if trace is None or trace.get("request_body") is None:
         raise web.HTTPNotFound(text="trace or raw request not found")
-    classification_value = trace.get("classification") or {}
-    body = {"protocol": trace["protocol"], "payload": trace["request_body"], "proposed_tool_calls": classification_value.get("proposed_actions") or classification_value.get("proposed_tool_calls") or []}
-    analysis = classification_payload(body["protocol"], body["payload"])
-    normalized = normalize(analysis, source_format_override=body["protocol"])
-    result = await asyncio.to_thread(DecisionPipeline().classify, normalized, body["proposed_tool_calls"], await _store_call(request, "enabled_rules"))
-    return web.json_response({"replay_of": request.match_info["trace_id"], "result": result.to_dict()})
+    body = {"protocol": trace["protocol"], "payload": trace["request_body"]}
+    result = await asyncio.to_thread(
+        evaluate_dlp, body["payload"], protocol=body["protocol"], upstream=request.app[UPSTREAM_KEY],
+        identity={"trusted": False, "roles": []}, targets=await _store_call(request, "list_destinations"),
+        policies=await _store_call(request, "list_dlp_policies", True),
+    )
+    return web.json_response({"replay_of": request.match_info["trace_id"], "result": result, "redacted_input": True})
 
 
 async def settings(request: web.Request) -> web.Response:
@@ -297,6 +309,137 @@ async def _test_model(stage: str) -> web.Response:
     classifier = LLMClassifier(ReviewerSettings.from_env(stage))
     result = await asyncio.to_thread(classifier.run, [{"type": "user", "text": "只读检查"}], [])
     return web.json_response({"configured": classifier.configured, "result": result.to_dict()}, status=200 if result.status == "completed" else 503)
+
+
+async def destinations(request: web.Request) -> web.Response:
+    return web.json_response({"data": await _store_call(request, "list_destinations")})
+
+
+async def create_destination(request: web.Request) -> web.Response:
+    try:
+        return web.json_response(await _store_call(request, "create_destination", await _json(request)), status=201)
+    except ValueError as exc:
+        raise web.HTTPUnprocessableEntity(text=str(exc)) from exc
+
+
+async def update_destination(request: web.Request) -> web.Response:
+    try:
+        return web.json_response(await _store_call(request, "update_destination", request.match_info["destination_id"], await _json(request)))
+    except KeyError as exc:
+        raise web.HTTPNotFound(text=str(exc)) from exc
+    except ValueError as exc:
+        raise web.HTTPUnprocessableEntity(text=str(exc)) from exc
+
+
+async def delete_destination(request: web.Request) -> web.Response:
+    await _store_call(request, "delete_destination", request.match_info["destination_id"])
+    return web.Response(status=204)
+
+
+async def dlp_policies(request: web.Request) -> web.Response:
+    return web.json_response({"data": await _store_call(request, "list_dlp_policies")})
+
+
+async def compile_dlp(request: web.Request) -> web.Response:
+    try:
+        return web.json_response({"valid": True, "compiled": compile_dlp_policy(str((await _json(request)).get("text", "")))})
+    except DLPPolicyCompileError as exc:
+        return web.json_response({"valid": False, "errors": [{"field": "text", "message": str(exc)}]}, status=422)
+
+
+async def test_dlp(request: web.Request) -> web.Response:
+    body = await _json(request)
+    payload = body.get("payload") or {"model": body.get("model", "playground"), "messages": [{"role": "user", "content": body.get("text", "")}]}
+    policy = body.get("policy")
+    policies = await _store_call(request, "list_dlp_policies", True)
+    if isinstance(policy, dict):
+        policies = [*policies, {**policy, "id": "temporary", "version": 0, "enabled": True}]
+    result = await asyncio.to_thread(
+        evaluate_dlp, payload, protocol=str(body.get("protocol", "openai_chat_completions")),
+        upstream=request.app[UPSTREAM_KEY], identity={"trusted": False, "roles": []},
+        targets=await _store_call(request, "list_destinations"), policies=policies,
+    )
+    return web.json_response(result)
+
+
+async def create_dlp_policy(request: web.Request) -> web.Response:
+    body = await _json(request)
+    compiled = body.get("compiled")
+    if not isinstance(compiled, dict):
+        raise web.HTTPBadRequest(text="compiled policy is required")
+    try:
+        return web.json_response(await _store_call(request, "create_dlp_policy", compiled, bool(body.get("enabled"))), status=201)
+    except ValueError as exc:
+        raise web.HTTPUnprocessableEntity(text=str(exc)) from exc
+
+
+async def update_dlp_policy(request: web.Request) -> web.Response:
+    body = await _json(request)
+    compiled = body.get("compiled") or body
+    try:
+        return web.json_response(await _store_call(request, "update_dlp_policy", request.match_info["policy_id"], compiled))
+    except KeyError as exc:
+        raise web.HTTPNotFound(text=str(exc)) from exc
+    except ValueError as exc:
+        raise web.HTTPUnprocessableEntity(text=str(exc)) from exc
+
+
+async def delete_dlp_policy(request: web.Request) -> web.Response:
+    await _store_call(request, "delete_dlp_policy", request.match_info["policy_id"])
+    return web.Response(status=204)
+
+
+async def enable_dlp_policy(request: web.Request) -> web.Response:
+    return web.json_response(await _store_call(request, "set_dlp_policy_enabled", request.match_info["policy_id"], True))
+
+
+async def disable_dlp_policy(request: web.Request) -> web.Response:
+    return web.json_response(await _store_call(request, "set_dlp_policy_enabled", request.match_info["policy_id"], False))
+
+
+async def dlp_policy_versions(request: web.Request) -> web.Response:
+    return web.json_response({"data": await _store_call(request, "dlp_policy_versions", request.match_info["policy_id"])})
+
+
+async def raw_evidence(request: web.Request) -> web.Response:
+    token = request.app[ADMIN_TOKEN_KEY]
+    if not isinstance(token, str) or not token:
+        raise web.HTTPForbidden(text="AUTOMODE_ADMIN_TOKEN is required to decrypt evidence")
+    supplied = request.headers.get("x-automode-admin-token")
+    authorization = request.headers.get("authorization", "")
+    if not supplied and authorization.lower().startswith("bearer "):
+        supplied = authorization[7:]
+    if not supplied or not hmac.compare_digest(supplied, token):
+        raise web.HTTPUnauthorized(text="admin authentication required")
+    try:
+        peer = ipaddress.ip_address((request.remote or "").split("%", 1)[0])
+    except ValueError as exc:
+        raise web.HTTPForbidden(text="raw evidence is loopback-only") from exc
+    if not peer.is_loopback or not _bind_is_loopback(request.app[BIND_HOST_KEY]):
+        raise web.HTTPForbidden(text="raw evidence is loopback-only")
+    try:
+        value = await _store_call(
+            request, "evidence", request.match_info["evidence_id"], actor=request.headers.get("x-automode-operator", "admin-token"),
+            purpose=request.query.get("purpose", "incident_review"), source=request.remote or "loopback",
+        )
+    except KeyError as exc:
+        raise web.HTTPNotFound(text=str(exc)) from exc
+    except RuntimeError as exc:
+        raise web.HTTPServiceUnavailable(text=str(exc)) from exc
+    return web.json_response(value)
+
+
+async def purge_evidence(request: web.Request) -> web.Response:
+    return web.json_response({"deleted": await _store_call(request, "purge_expired_evidence")})
+
+
+def _bind_is_loopback(host: str) -> bool:
+    if host in {"localhost", "127.0.0.1", "::1"}:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 async def _store_call(request: web.Request, method: str, *args: Any, **kwargs: Any) -> Any:
