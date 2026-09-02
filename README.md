@@ -13,7 +13,7 @@
 
 - **多协议透明代理**：Anthropic Messages / OpenAI Chat Completions / OpenAI Responses，JSON 与 SSE 流式原样转发，零协议转换。
 - **完整出站请求检测**：扫描 user/system/developer、tool result、历史消息和工具描述中的文本。
-- **高置信数据分类**：本地识别凭据、Token、密码、私钥、连接串、PII、源码/配置及管理员关键词。
+- **可治理的本地检测**：内置检测器与管理员自定义正则均可按类别启停；识别凭据、Token、密码、私钥、连接串、PII、源码/配置及管理员关键词。
 - **目标与身份上下文**：模型注册表区分 trusted/external；可信代理网段注入用户、部门、角色和 Agent。
 - **确定性策略优先**：敏感数据发往 external 目标直接告警，LLM 不能推翻硬策略。
 - **加密证据**：Trace 只保存脱敏请求；原文使用 AES-256-GCM 加密保存并审计每次查看。
@@ -136,6 +136,7 @@ Fast/Deep 也可在控制台“设置”页临时应用 URL、模型和 Key。Ke
 | `/api/alerts` | 告警查询、状态流转（open/acknowledged/false_positive/resolved）与人工反馈 |
 | `/api/destinations` | 模型目标注册表，维护模型模式、供应商、区域和信任级别 |
 | `/api/dlp-policies` | 出站数据策略编译、测试、启停和版本 |
+| `/api/detectors` | 内置及自定义正则检测器的查询、启停、创建和删除；自定义规则先经本地正则校验 |
 | `/api/evidence/{id}/raw` | 仅 loopback + 管理 Token 可用的加密原文查看，并记录访问审计 |
 | `/api/rules` | 兼容的模型动作旁证规则 |
 | `/api/playground/classify` | 三协议完整出站请求 DLP 测试，不执行工具、不转发模型 |
@@ -193,7 +194,7 @@ npm --prefix web run build
 npm --prefix web audit
 ```
 
-当前基线：后端 119 个测试、前端 6 个测试和生产构建全部通过。
+当前本地基线（2026-09-02）：后端 123 个测试、前端 6 个测试和生产构建全部通过；这不是生产或 live 验证。
 
 ## 文档
 

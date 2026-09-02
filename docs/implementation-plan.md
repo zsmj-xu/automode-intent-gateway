@@ -37,6 +37,8 @@ MVP 高置信类别：
 - `source_code`：代码块、代码结构和配置结构；所有源码默认敏感。
 - `admin_keyword`：已启用 DLP 策略声明的管理员关键词。
 
+内置检测器和管理员创建的自定义正则检测器均由治理控制台管理；只有已启用检测器的命中会参与当前请求的 DLP 判定。自定义正则在保存前由服务端编译校验，控制台提供本地样例匹配预检；这不是隔离执行沙箱。
+
 每个 finding 包含类别、JSON path、置信度、检测器、不可逆指纹和强脱敏片段。源码不生成正文片段，只输出 `[SOURCE_CODE_REDACTED]`。
 
 普通 Trace 在写入前替换敏感片段；会话摘要不保存原始用户陈述。完整原文只进入可选加密证据。
@@ -59,7 +61,7 @@ MVP 高置信类别：
 内置硬策略：
 
 ```text
-data_findings 非空 AND destination.trust = external → alert
+已启用检测器产生 data_findings AND destination.trust = external → alert
 ```
 
 管理员自然语言策略编译为受限字段：数据类别、目标信任级别、部门、角色、Agent、模型、关键词、`alert|review` 效果和优先级。
@@ -90,6 +92,7 @@ data_findings 非空 AND destination.trust = external → alert
 
 - `/api/destinations`：目标注册表。
 - `/api/dlp-policies`：策略编译、测试、启停和版本。
+- `/api/detectors`：内置/自定义检测器查询、启停，以及自定义正则的创建和删除。
 - `/api/playground/classify`：不转发模型的 DLP 测试。
 - `/api/evidence/{id}/raw`：loopback 原文解密和访问审计。
 - `/api/dashboard`：DLP 请求、告警、类别和目标统计。
