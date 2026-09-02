@@ -46,6 +46,9 @@ def register_admin_routes(app: web.Application, store: TraceStore) -> None:
     routes.add_patch("/api/prompts", update_prompts_handler)
     routes.add_post("/api/prompts/reset", reset_prompts_handler)
     routes.add_get("/api/detectors", get_detectors_handler)
+    routes.add_post("/api/detectors", create_detector_handler)
+    routes.add_patch("/api/detectors/{detector_id}", update_detector_handler)
+    routes.add_delete("/api/detectors/{detector_id}", delete_detector_handler)
     routes.add_get("/api/rules", rules)
     routes.add_post("/api/rules/compile", compile_rule)
     routes.add_post("/api/rules/test", test_rule)
@@ -164,6 +167,43 @@ async def reset_prompts_handler(request: web.Request) -> web.Response:
 async def get_detectors_handler(request: web.Request) -> web.Response:
     data = await _store_call(request, "get_detectors")
     return web.json_response({"data": data})
+
+
+async def create_detector_handler(request: web.Request) -> web.Response:
+    body = await _json(request)
+    name = str(body.get("name", "")).strip()
+    category = str(body.get("category", "")).strip()
+    description = str(body.get("description", "")).strip()
+    pattern = str(body.get("pattern", "")).strip()
+    if not name or not pattern or not category:
+        raise web.HTTPBadRequest(text="name, category, and pattern are required")
+    try:
+        created = await _store_call(request, "add_custom_detector", name, category, description, pattern)
+        return web.json_response({"data": created}, status=201)
+    except ValueError as exc:
+        raise web.HTTPBadRequest(text=str(exc)) from exc
+
+
+async def update_detector_handler(request: web.Request) -> web.Response:
+    body = await _json(request)
+    enabled = body.get("enabled")
+    if not isinstance(enabled, bool):
+        raise web.HTTPBadRequest(text="enabled boolean is required")
+    detector_id = request.match_info["detector_id"]
+    try:
+        value = await _store_call(request, "set_detector_enabled", detector_id, enabled)
+        return web.json_response({"data": value})
+    except KeyError as exc:
+        raise web.HTTPNotFound(text=str(exc)) from exc
+
+
+async def delete_detector_handler(request: web.Request) -> web.Response:
+    detector_id = request.match_info["detector_id"]
+    try:
+        await _store_call(request, "delete_custom_detector", detector_id)
+        return web.json_response({"deleted": True, "id": detector_id})
+    except KeyError as exc:
+        raise web.HTTPNotFound(text=str(exc)) from exc
 
 
 async def alert(request: web.Request) -> web.Response:

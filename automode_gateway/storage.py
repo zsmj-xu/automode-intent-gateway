@@ -1302,18 +1302,115 @@ class TraceStore:
         return self.get_prompts()
 
     # Detectors management ------------------------------------------------------
+    def get_disabled_detectors(self) -> set[str]:
+        with self._connect() as connection:
+            row = connection.execute("SELECT value_json FROM settings WHERE key='disabled_detectors'").fetchone()
+        return set(json.loads(row[0])) if row and row[0] else set()
+
+    def get_custom_detectors(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            row = connection.execute("SELECT value_json FROM settings WHERE key='custom_detectors'").fetchone()
+        return list(json.loads(row[0])) if row and row[0] else []
+
+    def add_custom_detector(self, name: str, category: str, description: str, pattern: str) -> dict[str, Any]:
+        # Validate regex pattern
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            raise ValueError(f"正则表达式格式错误: {exc}") from exc
+
+        category_allowed = {"credential", "pii", "source_code", "admin_keyword"}
+        if category not in category_allowed:
+            raise ValueError(f"无效的检测类别: {category}")
+
+        det_id = f"cust_{uuid.uuid4().hex[:8]}"
+        new_item = {
+            "id": det_id,
+            "name": name.strip() or "自定义检测器",
+            "category": category,
+            "description": description.strip(),
+            "pattern": pattern.strip(),
+            "custom": True,
+        }
+
+        with self._connect() as connection:
+            current = self.get_custom_detectors()
+            current.append(new_item)
+            connection.execute(
+                "INSERT INTO settings (key, value_json, updated_at) VALUES ('custom_detectors', ?, ?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at",
+                (json.dumps(current, ensure_ascii=False), _now()),
+            )
+            _audit(connection, "detector.created", "detector", det_id, {"name": name, "category": category})
+
+        detectors = {d["id"]: d for d in self.get_detectors()}
+        return detectors[det_id]
+
+    def delete_custom_detector(self, detector_id: str) -> bool:
+        with self._connect() as connection:
+            current = self.get_custom_detectors()
+            filtered = [d for d in current if d["id"] != detector_id]
+            if len(filtered) == len(current):
+                raise KeyError(f"自定义检测器不存在: {detector_id}")
+            connection.execute(
+                "INSERT INTO settings (key, value_json, updated_at) VALUES ('custom_detectors', ?, ?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at",
+                (json.dumps(filtered, ensure_ascii=False), _now()),
+            )
+            # Also remove from disabled list if it was disabled
+            disabled = self.get_disabled_detectors()
+            if detector_id in disabled:
+                disabled.discard(detector_id)
+                connection.execute(
+                    "INSERT INTO settings (key, value_json, updated_at) VALUES ('disabled_detectors', ?, ?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at",
+                    (json.dumps(sorted(disabled), ensure_ascii=False), _now()),
+                )
+            _audit(connection, "detector.deleted", "detector", detector_id, {})
+        return True
+
     def get_detectors(self) -> list[dict[str, Any]]:
-        return [
+        disabled = self.get_disabled_detectors()
+        builtin = [
             {
                 "id": item["id"],
                 "name": item["name"],
                 "category": item["category"],
                 "description": item["description"],
                 "pattern": item["pattern"],
-                "enabled": True,
+                "enabled": item["id"] not in disabled,
+                "custom": False,
             }
             for item in BUILTIN_DETECTORS
         ]
+        custom = [
+            {
+                "id": item["id"],
+                "name": item["name"],
+                "category": item["category"],
+                "description": item["description"],
+                "pattern": item["pattern"],
+                "enabled": item["id"] not in disabled,
+                "custom": True,
+            }
+            for item in self.get_custom_detectors()
+        ]
+        return builtin + custom
+
+    def set_detector_enabled(self, detector_id: str, enabled: bool) -> dict[str, Any]:
+        all_detectors = self.get_detectors()
+        if not any(item["id"] == detector_id for item in all_detectors):
+            raise KeyError(f"detector not found: {detector_id}")
+        with self._connect() as connection:
+            disabled = self.get_disabled_detectors()
+            if enabled:
+                disabled.discard(detector_id)
+            else:
+                disabled.add(detector_id)
+            connection.execute(
+                "INSERT INTO settings (key, value_json, updated_at) VALUES ('disabled_detectors', ?, ?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at",
+                (json.dumps(sorted(disabled), ensure_ascii=False), _now()),
+            )
+            _audit(connection, "detector.enabled" if enabled else "detector.disabled", "detector", detector_id, {})
+        detectors = {d["id"]: d for d in self.get_detectors()}
+        return detectors[detector_id]
 
     def record_test_run(
         self,

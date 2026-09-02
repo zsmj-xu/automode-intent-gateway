@@ -144,6 +144,8 @@ BUILTIN_DETECTORS: list[dict[str, Any]] = [
 def scan_payload(
     payload: Any,
     keyword_policies: Iterable[dict[str, Any]] = (),
+    disabled_detectors: Iterable[str] = (),
+    custom_detectors: Iterable[dict[str, Any]] = (),
 ) -> list[dict[str, Any]]:
     keywords: list[tuple[str, str]] = []
     for policy in keyword_policies:
@@ -151,9 +153,11 @@ def scan_payload(
         for keyword in (policy.get("conditions") or {}).get("keywords") or []:
             if isinstance(keyword, str) and keyword:
                 keywords.append((policy_id, keyword))
+    disabled = set(disabled_detectors)
+    custom_list = list(custom_detectors)
     findings: list[DataFinding] = []
     for path, text in _walk_strings(payload):
-        findings.extend(_scan_text(path, text, keywords))
+        findings.extend(_scan_text(path, text, keywords, disabled, custom_list))
     unique: dict[tuple[str, str, int, int, str], DataFinding] = {}
     for finding in findings:
         key = (finding.category, finding.path, finding.start, finding.end, finding.fingerprint)
@@ -176,28 +180,42 @@ def _scan_text(
     path: str,
     text: str,
     keywords: list[tuple[str, str]],
+    disabled: set[str] | None = None,
+    custom_detectors: list[dict[str, Any]] | None = None,
 ) -> list[DataFinding]:
     import hashlib
 
+    disabled = disabled or set()
     matches: list[tuple[str, int, int, str, str]] = []
-    patterns = (
-        ("credential", "private_key", r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----.*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
-        ("credential", "bearer_token", r"\bBearer\s+[A-Za-z0-9._~+/=-]{12,}"),
-        ("credential", "openai_key", r"\bsk-[A-Za-z0-9_-]{12,}\b"),
-        ("credential", "aws_access_key", r"\bAKIA[0-9A-Z]{16}\b"),
-        ("credential", "secret_assignment", r"(?i)\b(?:api[_ -]?key|access[_ -]?token|password|passwd|secret)\b\s*[:=]\s*[^\s,;]{4,}"),
-        ("credential", "connection_string", r"(?i)\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis)://[^\s:@/]+:[^\s@/]+@[^\s]+"),
-        ("pii", "cn_identity", r"(?<!\d)[1-9]\d{5}(?:18|19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[0-9Xx](?!\d)"),
-        ("pii", "us_ssn", r"(?<!\d)\d{3}-\d{2}-\d{4}(?!\d)"),
-        ("pii", "cn_phone", r"(?<!\d)1[3-9]\d{9}(?!\d)"),
-        ("pii", "email", r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b"),
-    )
-    for category, detector, pattern in patterns:
-        for match in re.finditer(pattern, text, re.S):
-            matches.append((category, match.start(), match.end(), detector, match.group(0)))
 
-    if _looks_like_source_or_config(text):
-        matches.append(("source_code", 0, len(text), "source_or_config", text))
+    # Builtin regex patterns
+    for item in BUILTIN_DETECTORS:
+        det_id = item["id"]
+        if det_id in disabled:
+            continue
+        if det_id == "source_or_config":
+            if _looks_like_source_or_config(text):
+                matches.append(("source_code", 0, len(text), "source_or_config", text))
+            continue
+        pattern = item["pattern"]
+        for match in re.finditer(pattern, text, re.S):
+            matches.append((item["category"], match.start(), match.end(), det_id, match.group(0)))
+
+    # Custom regex patterns
+    for custom in (custom_detectors or []):
+        det_id = str(custom.get("id"))
+        if det_id in disabled:
+            continue
+        category = str(custom.get("category", "credential"))
+        pattern = str(custom.get("pattern", ""))
+        if not pattern:
+            continue
+        try:
+            for match in re.finditer(pattern, text, re.S):
+                matches.append((category, match.start(), match.end(), det_id, match.group(0)))
+        except re.error:
+            pass
+
     for policy_id, keyword in keywords:
         for match in re.finditer(re.escape(keyword), text, re.I):
             matches.append(("admin_keyword", match.start(), match.end(), f"keyword:{policy_id}", match.group(0)))
@@ -302,13 +320,15 @@ def evaluate_dlp(
     identity: dict[str, Any],
     targets: Iterable[dict[str, Any]] = (),
     policies: Iterable[dict[str, Any]] = (),
+    disabled_detectors: Iterable[str] = (),
+    custom_detectors: Iterable[dict[str, Any]] = (),
     prompts: dict[str, str] | None = None,
     fast_transport: Transport | None = None,
     deep_transport: Transport | None = None,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     policies = list(policies)
-    findings = scan_payload(payload, policies)
+    findings = scan_payload(payload, policies, disabled_detectors=disabled_detectors, custom_detectors=custom_detectors)
     destination = resolve_destination(str(payload.get("model") or "") or None, upstream, targets)
     categories = sorted({str(item["category"]) for item in findings})
     purpose = _request_purpose(payload, protocol)

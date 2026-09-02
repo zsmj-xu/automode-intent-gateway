@@ -130,8 +130,10 @@ export function App() {
       {menuOpen && <button className="backdrop" aria-label="关闭导航" onClick={() => setMenuOpen(false)} />}
       <main>
         <header>
-          <button className="icon-button mobile-menu" aria-label="打开导航" onClick={() => setMenuOpen(true)}><Menu /></button>
-          <div><p className="eyebrow">ENTERPRISE AI SHADOW DLP</p><h1>{title}</h1></div>
+          <div className="header-main">
+            <button className="icon-button mobile-menu" aria-label="打开导航" onClick={() => setMenuOpen(true)}><Menu /></button>
+            <div><p className="eyebrow">ENTERPRISE AI SHADOW DLP</p><h1>{title}</h1></div>
+          </div>
           <div className="header-actions">
             <button className="secondary compact" onClick={() => setPaletteOpen(true)}><span className="kbd">⌘K</span>命令</button>
             <button className="secondary compact" onClick={() => setRefresh(value => value + 1)}><RefreshCw size={16} />刷新</button>

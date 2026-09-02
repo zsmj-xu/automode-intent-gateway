@@ -178,6 +178,7 @@ export interface DetectorItem {
   description: string
   pattern: string
   enabled: boolean
+  custom?: boolean
 }
 
 export interface PromptsResponse {

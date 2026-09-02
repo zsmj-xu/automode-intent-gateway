@@ -32,6 +32,6 @@
 ## 当前状态
 
 - Anthropic Messages、OpenAI Chat Completions、OpenAI Responses、JSON/SSE 和 Shadow DLP 均已实现。
-- 出站数据策略采用独立受限结构化编译，支持预览、测试、启停和版本；旧动作规则仅作兼容旁证。
+- 出站数据策略采用独立受限结构化编译，支持预览、测试、启停和版本；确定性硬检测器矩阵支持独立启停与自定义正则检测器录入及沙箱测试；审查模型 System Prompts 支持可视化在线修改与重置。
 - 会话按优先级归组：显式 session id（header/metadata/`previous_response_id`）→ 会话内容指纹（`session_fingerprint.py`，校验前缀续接）→ trace 级 fallback；历史 capability/constraint 摘要仅作旁证，DLP 结论以完整出站请求、可信身份和目标模型为输入。
-- 当前验证基线为后端 119 个测试、前端 6 个测试和生产构建通过；Request Enforce、Action Gateway、SSO/RBAC、KMS、OCR 和多机部署仍未实现。
+- 当前验证基线为后端 123 个测试、前端 6 个测试和生产构建通过；Request Enforce、Action Gateway、SSO/RBAC、KMS、OCR 和多机部署仍未实现。

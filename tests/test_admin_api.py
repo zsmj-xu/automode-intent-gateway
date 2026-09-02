@@ -300,7 +300,7 @@ class AdminApiTests(unittest.IsolatedAsyncioTestCase):
             data = await response.json()
             self.assertEqual(data["data"]["outbound_dlp"], data["defaults"]["outbound_dlp"])
 
-    async def test_detectors_are_listed_as_always_enabled(self):
+    async def test_detectors_crud_and_toggle(self):
         async with self.client.get(self.server.make_url("/api/detectors")) as response:
             self.assertEqual(response.status, 200)
             data = await response.json()
@@ -309,7 +309,40 @@ class AdminApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(pk["enabled"])
 
         async with self.client.patch(self.server.make_url("/api/detectors/private_key"), json={"enabled": False}) as response:
-            self.assertEqual(response.status, 405)
+            self.assertEqual(response.status, 200)
+            data = await response.json()
+            self.assertFalse(data["data"]["enabled"])
+
+        async with self.client.patch(self.server.make_url("/api/detectors/private_key"), json={"enabled": True}) as response:
+            self.assertEqual(response.status, 200)
+            data = await response.json()
+            self.assertTrue(data["data"]["enabled"])
+
+        # Create custom detector
+        custom_payload = {
+            "name": "内部员工工号",
+            "category": "credential",
+            "description": "检测 HT- 开头的工号",
+            "pattern": r"\bHT-\d{6}\b",
+        }
+        async with self.client.post(self.server.make_url("/api/detectors"), json=custom_payload) as response:
+            self.assertEqual(response.status, 201)
+            created = await response.json()
+            self.assertEqual(created["data"]["name"], "内部员工工号")
+            self.assertTrue(created["data"]["custom"])
+            det_id = created["data"]["id"]
+
+        # Toggle custom detector
+        async with self.client.patch(self.server.make_url(f"/api/detectors/{det_id}"), json={"enabled": False}) as response:
+            self.assertEqual(response.status, 200)
+            data = await response.json()
+            self.assertFalse(data["data"]["enabled"])
+
+        # Delete custom detector
+        async with self.client.delete(self.server.make_url(f"/api/detectors/{det_id}")) as response:
+            self.assertEqual(response.status, 200)
+            data = await response.json()
+            self.assertTrue(data["deleted"])
 
 
 class AdminAuthTests(unittest.IsolatedAsyncioTestCase):
