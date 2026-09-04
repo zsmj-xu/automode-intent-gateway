@@ -25,6 +25,7 @@ from .response_parser import extract_tool_calls
 from .review_context import build_review_context
 from .service import classify_payload
 from .session_fingerprint import conversation_fingerprint
+from .session_risk import assess as assess_session_risk
 from .storage import TraceStore
 
 
@@ -125,7 +126,7 @@ class Gateway:
             "declared_tool_count": declared_tool_count,
         })
         if analysis_payload is not None:
-            self._background(self._classify_after_persistence(persist_task, trace_id, analysis_payload, protocol, identity))
+            self._background(self._classify_after_persistence(persist_task, trace_id, analysis_payload, protocol, identity, latest_user_text))
 
         upstream_url = _join_url(self.upstream, request.path_qs)
         outbound_headers = _request_headers(request.headers, trace_id)
@@ -213,9 +214,30 @@ class Gateway:
         payload: dict[str, Any],
         protocol: str,
         identity: dict[str, Any],
+        raw_user_text: str,
     ) -> None:
         await persist_task
         await self._classify_dlp(trace_id, payload, protocol, identity)
+        if raw_user_text:
+            await self._classify_session_risk(trace_id, raw_user_text)
+
+    async def _classify_session_risk(self, trace_id: str, raw_user_text: str) -> None:
+        """Observe a user's current risk intent without persisting their raw text."""
+        try:
+            # Fetch only the derived prior summary so no historic user text is
+            # retained or sent to the reviewer.
+            trace = await asyncio.to_thread(self.store.get, trace_id)
+            session_id = trace.get("session_record_id") if trace else None
+            prior = await asyncio.to_thread(self.store.session_risk_summary, session_id) if session_id else None
+            prompts = await asyncio.to_thread(self.store.get_prompts)
+            assessment = await asyncio.to_thread(assess_session_risk, raw_user_text, prior, prompts)
+            segment, alert_id = await asyncio.to_thread(self.store.record_session_risk, trace_id, assessment.to_dict())
+            self.broker.publish("session_risk.updated", {"trace_id": trace_id, "session_id": segment["session_id"], "summary": segment})
+            if alert_id:
+                self.broker.publish("alert.created", {"id": alert_id, "trace_id": trace_id, "severity": segment["severity"], "reason_code": segment["reason_code"], "source": "session_risk"})
+        except Exception:
+            # Session-risk observation must never affect transparent forwarding or DLP.
+            return
 
     async def _classify_dlp(
         self,

@@ -152,7 +152,11 @@ export function Alerts({ refresh, onOpenTrace }: { refresh: number; onOpenTrace?
             <div>
               <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
                 <span className={`alert-type-tag ${selected.alert_type === 'dlp' || (selected.data_findings && selected.data_findings.length > 0) ? 'dlp' : 'intent'}`}>
-                  {selected.alert_type === 'dlp' || (selected.data_findings && selected.data_findings.length > 0) ? '🛡️ 出站数据违规告警' : '⚡ 行为意图违规告警'}
+                  {selected.alert_type === 'dlp' || (selected.data_findings && selected.data_findings.length > 0)
+                    ? '🛡️ 出站数据违规告警'
+                    : selected.final_stage === 'session_risk'
+                    ? '⚡ 会话用户意图风险告警'
+                    : '⚡ 行为意图违规告警'}
                 </span>
                 <p className="eyebrow" style={{ margin: 0 }}>ALERT DETAIL</p>
               </div>
@@ -193,13 +197,18 @@ export function Alerts({ refresh, onOpenTrace }: { refresh: number; onOpenTrace?
             {/* 2. 行为意图与动作判定（Intent 维度） */}
             {(selected.actions?.length > 0 || selected.alert_type === 'intent_action') && (
               <div className="evidence" style={{ borderLeft: '3px solid var(--warn)', paddingLeft: '12px' }}>
-                <b>⚡ 行为意图与动作旁证 (Intent)</b>
+                <b>⚡ {selected.final_stage === 'session_risk' ? '用户会话意图风险态势 (Session Risk)' : '模型动作与意图分析 (Intent & Actions)'}</b>
                 {selected.actions?.map((action, index) => (
-                  <span key={index}>
-                    <code>{action.name}</code> {action.target ? ` · 目标: ${action.target}` : ''}
-                    {action.capability && ` [${action.capability}]`}
+                  <span key={`${action.name}-${index}`}>
+                    <code>{action.capability}</code> <b>{action.name}</b> {action.target && `-> ${action.target}`}
+                    {action.side_effect && <span className="status-pill warn" style={{ marginLeft: '6px', fontSize: '10px' }}>副作用</span>}
                   </span>
                 ))}
+                {(!selected.actions?.length && selected.final_stage === 'session_risk') && (
+                  <p style={{ fontSize: '12px', color: 'var(--muted)', margin: '6px 0 0', lineHeight: 1.4 }}>
+                    注：本告警为后台 Observe 识别到的用户潜在高危意图态势，不证明 Agent 执行了真实的外部工具调用。
+                  </p>
+                )}
               </div>
             )}
 

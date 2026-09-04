@@ -5,7 +5,10 @@ import { useLoad } from '../lib/hooks'
 import { patch, post } from '../api'
 import { ErrorState, Loading, PanelTitle } from '../components/ui'
 
-const PROMPT_KEY = 'outbound_dlp' as const
+const PROMPT_TABS = [
+  { key: 'outbound_dlp', label: '出站 DLP' },
+  { key: 'session_risk_intent', label: '会话风险意图' },
+] as const
 
 export function SettingsPage() {
   const { data, error } = useLoad<Json>('/api/settings')
@@ -18,6 +21,7 @@ export function SettingsPage() {
   const [promptRefresh, setPromptRefresh] = useState(0)
   const { data: promptsData } = useLoad<PromptsResponse>(`/api/prompts?v=${promptRefresh}`, promptRefresh)
   const [promptDrafts, setPromptDrafts] = useState<Record<string, string>>({})
+  const [activePromptKey, setActivePromptKey] = useState<'outbound_dlp' | 'session_risk_intent'>('outbound_dlp')
   const [promptSaving, setPromptSaving] = useState(false)
   const [promptStatus, setPromptStatus] = useState('')
 
@@ -62,8 +66,8 @@ export function SettingsPage() {
     setPromptSaving(true)
     setPromptStatus('')
     try {
-      const currentText = promptDrafts[PROMPT_KEY] || ''
-      await patch('/api/prompts', { prompts: { [PROMPT_KEY]: currentText } })
+      const currentText = promptDrafts[activePromptKey] || ''
+      await patch('/api/prompts', { prompts: { [activePromptKey]: currentText } })
       setPromptStatus('提示词已保存并生效')
       setPromptRefresh(v => v + 1)
     } catch (err) {
@@ -77,7 +81,7 @@ export function SettingsPage() {
     setPromptSaving(true)
     setPromptStatus('')
     try {
-      await post('/api/prompts/reset', { name: PROMPT_KEY })
+      await post('/api/prompts/reset', { name: activePromptKey })
       setPromptStatus('已恢复至系统默认提示词')
       setPromptRefresh(v => v + 1)
     } catch (err) {
@@ -90,8 +94,8 @@ export function SettingsPage() {
   if (error) return <ErrorState message={error} />
   if (!data) return <Loading />
 
-  const currentPromptContent = promptDrafts[PROMPT_KEY] || ''
-  const defaultPromptContent = promptsData?.defaults?.[PROMPT_KEY] || ''
+  const currentPromptContent = promptDrafts[activePromptKey] || ''
+  const defaultPromptContent = promptsData?.defaults?.[activePromptKey] || ''
   const isCustomized = currentPromptContent !== defaultPromptContent
 
   return (
@@ -121,10 +125,21 @@ export function SettingsPage() {
       <section className="panel" style={{ gridColumn: '1 / -1' }}>
         <PanelTitle
           title="审查模型提示词 (System Prompts) 配置"
-          subtitle="用于判定模糊的出站数据策略事件；确定性敏感外发告警不会进入该审查。"
+          subtitle="DLP reviewer 接收脱敏信号；会话风险 reviewer 仅在低置信度时接收实时用户原文，结果不保存原文。"
         />
+        <div className="alert-filter-segmented" style={{ marginBottom: '10px' }}>
+          {PROMPT_TABS.map(tab => (
+            <button
+              key={tab.key}
+              className={activePromptKey === tab.key ? 'active' : ''}
+              onClick={() => { setActivePromptKey(tab.key); setPromptStatus(''); }}
+            >
+              {tab.label}
+            </button>
+          ))}
+        </div>
         <p style={{ fontSize: '12px', color: 'var(--muted)', margin: '0 0 10px' }}>
-          出站数据合规 (DLP)：用于判定模糊或异常敏感数据外发至非完全可信模型时的策略审查。
+          {activePromptKey === 'outbound_dlp' ? '出站数据合规：用于判定模糊或异常敏感数据外发至非完全可信模型时的策略审查。' : '会话风险意图：用于区分用户目的风险与外发动作意图；不得输出或复述用户原文。'}
         </p>
 
         <label>
@@ -138,7 +153,7 @@ export function SettingsPage() {
             className="mono"
             rows={10}
             value={currentPromptContent}
-            onChange={event => setPromptDrafts({ ...promptDrafts, [PROMPT_KEY]: event.target.value })}
+            onChange={event => setPromptDrafts({ ...promptDrafts, [activePromptKey]: event.target.value })}
             placeholder="请输入系统提示词..."
           />
         </label>

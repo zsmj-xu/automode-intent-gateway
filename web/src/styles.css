@@ -698,6 +698,53 @@ details summary { cursor: pointer; color: #9fb0d3; font-size: 11px; min-height: 
   background: rgba(251, 146, 60, 0.12);
   border-color: rgba(251, 146, 60, 0.4);
 }
+.dual-tag.intent-danger {
+  color: #f87171;
+  background: rgba(248, 113, 113, 0.14);
+  border-color: rgba(248, 113, 113, 0.45);
+}
+.dual-tag.intent-muted {
+  color: #94a3b8;
+  background: rgba(148, 163, 184, 0.08);
+  border-color: rgba(148, 163, 184, 0.25);
+}
+
+/* Session Risk Intent State in Detail */
+.session-risk-intent-card {
+  margin: 14px 0;
+  padding: 12px 14px;
+  background: rgba(15, 23, 42, 0.7);
+  border: 1px solid rgba(251, 146, 60, 0.35);
+  border-left: 4px solid var(--warn);
+  border-radius: 8px;
+}
+.session-risk-intent-card.critical {
+  border-left-color: var(--danger);
+  border-color: rgba(248, 113, 113, 0.4);
+}
+.risk-segment-item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 0;
+  border-bottom: 1px dashed rgba(255, 255, 255, 0.08);
+}
+.risk-segment-item:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+.risk-segment-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.risk-segment-summary {
+  font-size: 12px;
+  color: #cbd5e1;
+  margin: 2px 0 0;
+  line-height: 1.45;
+}
 
 /* Session Detail Dual Summary Grid */
 .session-dual-summary-grid {

@@ -17,6 +17,26 @@ const RISKS = ['low', 'medium', 'high', 'critical']
 const DECISIONS = ['allow', 'alert']
 const CAPABILITIES = ['read', 'write', 'execute', 'delete', 'publish', 'unknown']
 
+export const PURPOSE_RISK_LABELS: Record<string, { label: string; warn: boolean }> = {
+  benign: { label: '正常业务', warn: false },
+  dual_use: { label: '双重用途', warn: true },
+  credential_exfiltration: { label: '凭据窃取', warn: true },
+  unauthorized_access: { label: '未授权入侵', warn: true },
+  safety_evasion: { label: '策略规避', warn: true },
+  destructive_harm: { label: '破坏清库', warn: true },
+  fraud: { label: '钓鱼诈骗', warn: true },
+  privacy_invasion: { label: '侵犯隐私', warn: true },
+  physical_harm: { label: '人身威胁', warn: true },
+  malware: { label: '恶意代码', warn: true },
+  unknown: { label: '未知目的', warn: false },
+}
+
+export const TRANSFER_INTENT_LABELS: Record<string, { label: string; tagClass: string }> = {
+  none: { label: '无外发意图', tagClass: 'intent-muted' },
+  prepare: { label: '筹备外发', tagClass: 'intent-warn' },
+  external_transfer: { label: '外部推送', tagClass: 'intent-danger' },
+}
+
 export function Sessions({ refresh }: { refresh: number }) {
   const initial = useMemo(() => new URLSearchParams(window.location.search), [])
   const [filters, setFilters] = useState({
@@ -147,7 +167,7 @@ export function Sessions({ refresh }: { refresh: number }) {
                       <Risk level={row.max_risk} />
                     </div>
 
-                    {/* 双维度核心指标标签 */}
+                    {/* 多维度核心指标标签 */}
                     <div className="session-dual-tags">
                       {hasDlpRisk ? (
                         <span className="dual-tag dlp-warn" title={`敏感数据出站: ${row.dlp_categories?.join(', ') || '已告警'}`}>
@@ -164,13 +184,39 @@ export function Sessions({ refresh }: { refresh: number }) {
                       {hasIntentRisk ? (
                         <span className="dual-tag intent-warn" title="存在高危或越权行为意图">
                           <AlertTriangle size={12} />
-                          <span>意图: {row.intent_risk ? `${row.intent_risk.toUpperCase()}风险` : '动作存疑'}</span>
+                          <span>动作意图: {row.intent_risk ? `${row.intent_risk.toUpperCase()}风险` : '存疑'}</span>
                         </span>
                       ) : (
                         <span className="dual-tag intent-safe">
                           <Activity size={12} />
-                          <span>意图: 正常</span>
+                          <span>动作意图: 正常</span>
                         </span>
+                      )}
+
+                      {row.risk_intent_summary && (
+                        <>
+                          <span
+                            className={`dual-tag ${
+                              row.risk_intent_summary.severity === 'critical'
+                                ? 'intent-danger'
+                                : row.risk_intent_summary.severity === 'high'
+                                ? 'intent-warn'
+                                : 'intent-safe'
+                            }`}
+                            title={`用户目的风险: ${row.risk_intent_summary.purpose_risk}`}
+                          >
+                            <ShieldAlert size={12} />
+                            <span>目的: {PURPOSE_RISK_LABELS[row.risk_intent_summary.purpose_risk]?.label || row.risk_intent_summary.purpose_risk}</span>
+                          </span>
+                          <span
+                            className={`dual-tag ${
+                              TRANSFER_INTENT_LABELS[row.risk_intent_summary.transfer_intent]?.tagClass || 'intent-muted'
+                            }`}
+                            title={`外发动作意图: ${row.risk_intent_summary.transfer_intent}`}
+                          >
+                            <span>外发: {TRANSFER_INTENT_LABELS[row.risk_intent_summary.transfer_intent]?.label || row.risk_intent_summary.transfer_intent}</span>
+                          </span>
+                        </>
                       )}
                     </div>
 
@@ -227,7 +273,7 @@ function SessionDetail({ id, refresh, onClose }: { id: string; refresh: number; 
   if (error) return <ErrorState message={error} />
   if (!data) return <section className="panel detail-panel"><Loading /></section>
 
-  const { session, traces } = data
+  const { session, traces, risk_intent_segments } = data
   const filtered = traces.filter(trace => {
     if (!search.trim()) return true
     const haystack = `${trace.trace_id} ${trace.latest_user_text || ''} ${trace.tool_actions.map(action => `${action.tool_name} ${action.target || ''}`).join(' ')} ${trace.classification?.reason || ''}`.toLowerCase()
@@ -280,6 +326,56 @@ function SessionDetail({ id, refresh, onClose }: { id: string; refresh: number; 
           </div>
         </div>
       </div>
+
+      {risk_intent_segments?.length ? (
+        <div className={`session-risk-intent-card ${risk_intent_segments.some(s => s.severity === 'critical') ? 'critical' : ''}`}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px', flexWrap: 'wrap', gap: '6px' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+              <ShieldAlert size={15} color="var(--warn)" />
+              <b style={{ fontSize: '13px', color: '#f8fafc' }}>用户会话意图风险态势 (Session Risk)</b>
+            </div>
+            <span style={{ fontSize: '11px', color: 'var(--muted)' }}>
+              Observe 模式后台审计 · 非真实外部动作证明
+            </span>
+          </div>
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+            {risk_intent_segments.map(segment => {
+              const purposeInfo = PURPOSE_RISK_LABELS[segment.purpose_risk] || { label: segment.purpose_risk, warn: false }
+              const transferInfo = TRANSFER_INTENT_LABELS[segment.transfer_intent] || { label: segment.transfer_intent, tagClass: 'intent-muted' }
+              const isHighOrCrit = segment.severity === 'high' || segment.severity === 'critical'
+
+              return (
+                <div key={segment.id} className="risk-segment-item">
+                  <div className="risk-segment-header">
+                    <Risk level={segment.severity} />
+                    <span className={`dual-tag ${isHighOrCrit ? 'intent-danger' : 'intent-safe'}`}>
+                      目的: {purposeInfo.label}
+                    </span>
+                    <span className={`dual-tag ${transferInfo.tagClass}`}>
+                      外发: {transferInfo.label}
+                    </span>
+                    <span style={{ fontSize: '11px', color: 'var(--muted)', marginLeft: 'auto' }}>
+                      {formatTime(segment.started_at)}
+                    </span>
+                    {segment.state === 'needs_review' ? (
+                      <span className="status-pill warn" style={{ fontSize: '10px' }}>待复核</span>
+                    ) : (
+                      <span className="status-pill safe" style={{ fontSize: '10px' }}>已收敛</span>
+                    )}
+                  </div>
+                  {segment.summary && (
+                    <p className="risk-segment-summary">
+                      <b>判定说明：</b>{segment.summary}
+                      {segment.reason_code && <code> ({segment.reason_code})</code>}
+                    </p>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      ) : null}
 
       {session.authorization && (session.authorization.capabilities?.length || session.authorization.forbidden_capabilities?.length || session.authorization.statements?.length) ? (
         <SessionBaseline authorization={session.authorization} />

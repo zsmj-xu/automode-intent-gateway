@@ -41,6 +41,15 @@ CREATE TABLE IF NOT EXISTS sessions (
     conversation_fingerprint TEXT,
     authorization_json TEXT NOT NULL DEFAULT '{}'
 );
+CREATE TABLE IF NOT EXISTS session_risk_segments (
+    id TEXT PRIMARY KEY, session_id TEXT NOT NULL, trace_id TEXT NOT NULL,
+    started_at TEXT NOT NULL, ended_at TEXT NOT NULL,
+    purpose_risk TEXT NOT NULL, transfer_intent TEXT NOT NULL, severity TEXT NOT NULL,
+    state TEXT NOT NULL, reason_code TEXT NOT NULL, summary TEXT NOT NULL,
+    source TEXT NOT NULL, version TEXT NOT NULL, alert_id TEXT,
+    FOREIGN KEY(session_id) REFERENCES sessions(id), FOREIGN KEY(trace_id) REFERENCES traces(id)
+);
+CREATE INDEX IF NOT EXISTS idx_session_risk_segments_session ON session_risk_segments(session_id, started_at);
 CREATE TABLE IF NOT EXISTS traces (
     id TEXT PRIMARY KEY,
     created_at TEXT NOT NULL,
@@ -496,6 +505,76 @@ class TraceStore:
                     (inserted, trace["session_record_id"]),
                 )
 
+    # Session user-intent risk -----------------------------------------------
+    def session_risk_summary(self, session_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM session_risk_segments WHERE session_id=? ORDER BY ended_at DESC, rowid DESC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+        return _session_risk_row(row) if row else None
+
+    def session_risk_segments(self, session_id: str) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM session_risk_segments WHERE session_id=? ORDER BY started_at, rowid",
+                (session_id,),
+            ).fetchall()
+        return [_session_risk_row(row) for row in rows]
+
+    def record_session_risk(self, trace_id: str, assessment: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
+        """Store only derived risk fields.  Raw reviewer input never reaches SQLite."""
+        now = _now()
+        with self._connect() as connection:
+            trace = connection.execute("SELECT session_record_id FROM traces WHERE id=?", (trace_id,)).fetchone()
+            if trace is None or not trace["session_record_id"]:
+                raise KeyError("trace session not found")
+            session_id = trace["session_record_id"]
+            previous = connection.execute(
+                "SELECT * FROM session_risk_segments WHERE session_id=? ORDER BY ended_at DESC, rowid DESC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            values = {
+                "purpose_risk": str(assessment["purpose_risk"]), "transfer_intent": str(assessment["transfer_intent"]),
+                "severity": str(assessment["severity"]), "state": str(assessment["state"]),
+                "reason_code": str(assessment["reason_code"])[:80], "summary": _redact(str(assessment["summary"]))[:300],
+                "source": str(assessment["source"]), "version": str(assessment.get("version", "session-risk-v1")),
+            }
+            same = previous and all(previous[key] == values[key] for key in ("purpose_risk", "transfer_intent", "severity", "state", "reason_code", "source", "version"))
+            if same:
+                connection.execute("UPDATE session_risk_segments SET ended_at=?, trace_id=? WHERE id=?", (now, trace_id, previous["id"]))
+                segment_id = previous["id"]
+            else:
+                segment_id = str(uuid.uuid4())
+                connection.execute(
+                    """INSERT INTO session_risk_segments (
+                        id, session_id, trace_id, started_at, ended_at, purpose_risk, transfer_intent,
+                        severity, state, reason_code, summary, source, version, alert_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)""",
+                    (segment_id, session_id, trace_id, now, now, values["purpose_risk"], values["transfer_intent"], values["severity"], values["state"], values["reason_code"], values["summary"], values["source"], values["version"]),
+                )
+
+            alert_id: str | None = None
+            previous_severity = previous["severity"] if previous and previous["severity"] in _RISK_ORDER else "low"
+            changed_category = bool(previous and (previous["purpose_risk"] != values["purpose_risk"] or previous["transfer_intent"] != values["transfer_intent"]))
+            should_alert = values["severity"] in {"high", "critical"} and (not previous or _RISK_ORDER.index(values["severity"]) > _RISK_ORDER.index(previous_severity) or changed_category)
+            if should_alert:
+                alert_id = str(uuid.uuid4())
+                connection.execute(
+                    """INSERT INTO alerts (
+                        id, trace_id, classification_run_id, session_record_id, created_at, severity,
+                        reason_code, title, reason, evidence_json, actions_json, matched_rules_json,
+                        final_stage, evidence_id, data_findings_json, destination_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', '[]', '[]', 'session_risk', NULL, '[]', '{}')""",
+                    (alert_id, trace_id, f"session-risk:{segment_id}", session_id, now, values["severity"], values["reason_code"], f"{values['severity'].upper()}: session user-intent risk", values["summary"]),
+                )
+                connection.execute("UPDATE session_risk_segments SET alert_id=? WHERE id=?", (alert_id, segment_id))
+                connection.execute("UPDATE sessions SET alert_count=alert_count+1, max_risk=? WHERE id=?", (_max_risk_sql(connection, session_id, values["severity"]), session_id))
+            _audit(connection, "session_risk.recorded", "session", session_id, {"segment_id": segment_id, "severity": values["severity"], "alert": bool(alert_id)})
+            row = connection.execute("SELECT * FROM session_risk_segments WHERE id=?", (segment_id,)).fetchone()
+        assert row is not None
+        return _session_risk_row(row), alert_id
+
     def finish(
         self,
         trace_id: str,
@@ -883,6 +962,7 @@ class TraceStore:
                     row["has_dlp_alert"] = meta.get("has_dlp_alert", False)
                     row["has_intent_alert"] = meta.get("has_intent_alert", False)
                     row["intent_risk"] = tool_risks.get(sid, "low")
+                    row["risk_intent_summary"] = self.session_risk_summary(sid)
 
         if protocol:
             result = [row for row in result if protocol in row["protocols"]]
@@ -905,7 +985,11 @@ class TraceStore:
     def session(self, session_id: str) -> dict[str, Any] | None:
         with self._connect() as connection:
             row = connection.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
-        return _json_row(row, ("protocols_json", "models_json", "authorization_json")) if row else None
+        if row is None:
+            return None
+        value = _json_row(row, ("protocols_json", "models_json", "authorization_json"))
+        value["risk_intent_summary"] = self.session_risk_summary(session_id)
+        return value
 
     def session_baseline_for_trace(self, trace_id: str) -> dict[str, Any] | None:
         """The session-wide authorization baseline accumulated for a trace's session."""
@@ -1054,7 +1138,9 @@ class TraceStore:
                     stages = connection.execute("SELECT * FROM classification_stages WHERE run_id=? ORDER BY rowid", (run["id"],)).fetchall()
                     result.extend({"type": "classification_stage", "at": run["completed_at"], "trace_id": trace["id"], "stage": row["stage"], "status": row["status"], "verdict": row["verdict"], "reason_code": row["reason_code"], "reason": row["reason"], "model": row["model"], "latency_ms": row["latency_ms"], "risk": row["risk"], "matched_rules": json.loads(row["matched_rule_versions_json"] or "[]"), "evidence": json.loads(row["evidence_json"] or "[]")} for row in stages)
                     result.append({"type": "final_decision", "at": run["completed_at"], "trace_id": trace["id"], "decision": run["final_decision"], "stage": run["final_stage"]})
-        return result
+            risk_rows = connection.execute("SELECT * FROM session_risk_segments WHERE session_id=? ORDER BY started_at", (session_id,)).fetchall()
+            result.extend({"type": "session_risk", "at": row["started_at"], "ended_at": row["ended_at"], "trace_id": row["trace_id"], "purpose_risk": row["purpose_risk"], "transfer_intent": row["transfer_intent"], "severity": row["severity"], "state": row["state"], "reason_code": row["reason_code"], "summary": row["summary"]} for row in risk_rows)
+        return sorted(result, key=lambda item: str(item["at"]))
 
     def session_detail(self, session_id: str) -> dict[str, Any] | None:
         """Return a session plus every trace's full audit payload in one call.
@@ -1108,7 +1194,7 @@ class TraceStore:
                 "classification": self.classification(trace_id),
                 "alerts": alerts_by_trace.get(trace_id, []),
             })
-        return {"session": session, "traces": traces}
+        return {"session": session, "traces": traces, "risk_intent_segments": self.session_risk_segments(session_id)}
 
     def classification(self, trace_id: str) -> dict[str, Any] | None:
         with self._connect() as connection:
@@ -1826,6 +1912,17 @@ def _alert_row(row: sqlite3.Row) -> dict[str, Any]:
     value["destination_name"] = destination.get("name") or destination.get("model") or "未知模型"
     value["destination_trust"] = destination.get("trust", "external")
     return value
+
+
+def _session_risk_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"], "session_id": row["session_id"], "trace_id": row["trace_id"],
+        "started_at": row["started_at"], "ended_at": row["ended_at"],
+        "purpose_risk": row["purpose_risk"], "transfer_intent": row["transfer_intent"],
+        "severity": row["severity"], "state": row["state"], "reason_code": row["reason_code"],
+        "summary": row["summary"], "source": row["source"], "version": row["version"],
+        "alert_id": row["alert_id"],
+    }
 
 
 def _tool_action_row(row: sqlite3.Row) -> dict[str, Any]:

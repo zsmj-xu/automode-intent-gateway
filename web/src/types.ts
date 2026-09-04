@@ -24,6 +24,24 @@ export interface Session {
   has_dlp_alert?: boolean
   has_intent_alert?: boolean
   intent_risk?: Risk
+  risk_intent_summary?: RiskIntentSummary | null
+}
+
+export interface RiskIntentSummary {
+  id: string
+  session_id: string
+  trace_id: string
+  started_at: string
+  ended_at: string
+  purpose_risk: string
+  transfer_intent: 'none' | 'prepare' | 'external_transfer'
+  severity: Risk
+  state: 'resolved' | 'needs_review'
+  reason_code: string
+  summary: string
+  source: string
+  version: string
+  alert_id?: string | null
 }
 
 export interface ReviewEvent {
@@ -208,6 +226,7 @@ export interface TraceDetail {
 export interface SessionDetail {
   session: Session
   traces: TraceDetail[]
+  risk_intent_segments: RiskIntentSummary[]
 }
 
 export interface DashboardData {
