@@ -183,5 +183,210 @@ class DLPStorageTests(unittest.TestCase):
         self.assertIn("REDACTED", json.dumps(self.store.get(trace_id), ensure_ascii=False))
 
 
+class DLPControlledToolSchemaTests(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.db = os.path.join(self.tempdir.name, "test.db")
+        self.store = TraceStore(self.db)
+        self.identity = {
+            "trusted": True,
+            "source": "trusted_proxy",
+            "user_id": "test-user",
+            "department": "eng",
+            "roles": ["dev"],
+            "agent_id": "claude_code",
+        }
+
+    def tearDown(self):
+        self.tempdir.cleanup()
+
+    def test_tool_schema_storage_crud(self):
+        schemas = self.store.get_tool_schemas()
+        self.assertEqual(schemas, [])
+
+        fp = "f2ad28a6de17ba4bca50a4ce577c4604f8ccf3a2d93c30894bbf7de332d9df28"
+        item = self.store.add_tool_schema("SendMessage", fp, reason="Claude Code 内置工具")
+        self.assertEqual(item["tool_name"], "SendMessage")
+        self.assertEqual(item["content_fingerprint"], fp)
+        self.assertTrue(item["enabled"])
+
+        schemas = self.store.get_tool_schemas()
+        self.assertEqual(len(schemas), 1)
+
+        updated = self.store.set_tool_schema_enabled(item["id"], False)
+        self.assertFalse(updated["enabled"])
+
+        deleted = self.store.delete_tool_schema(item["id"])
+        self.assertTrue(deleted)
+        self.assertEqual(self.store.get_tool_schemas(), [])
+
+    def test_approved_tool_schema_exempts_tool_description_code(self):
+        desc = "```python\ndef send_message(to: str, content: str):\n    pass\n```"
+        import hashlib
+        fp = hashlib.sha256(desc.encode("utf-8")).hexdigest()
+        schema = self.store.add_tool_schema("SendMessage", fp)
+
+        payload = {
+            "model": "claude-3-7-sonnet",
+            "tools": [{"name": "SendMessage", "description": desc, "input_schema": {"type": "object"}}],
+            "messages": [{"role": "user", "content": "hello world"}],
+        }
+
+        result = evaluate_dlp(
+            payload,
+            protocol="anthropic_messages",
+            upstream="https://api.anthropic.com",
+            identity=self.identity,
+            tool_schemas=[schema],
+        )
+
+        self.assertEqual(result["final_decision"], "allow")
+        self.assertEqual(result["reason_code"], "TOOL_SCHEMA_APPROVED")
+        self.assertEqual(result["risk"], "low")
+        findings = result["data_findings"]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]["path_type"], "tool_description")
+        self.assertEqual(findings[0]["tool_name"], "SendMessage")
+        self.assertEqual(findings[0]["disposition"], "approved_metadata")
+        self.assertEqual(findings[0]["schema_id"], schema["id"])
+
+        redacted = redact_payload(payload, findings)
+        self.assertIn("def send_message", redacted["tools"][0]["description"])
+
+    def test_unapproved_tool_schema_calls_llm_reviewer(self):
+        desc = "```python\ndef execute_task(code: str):\n    pass\n```"
+        payload = {
+            "model": "claude-3-7-sonnet",
+            "tools": [{"name": "ExecuteTask", "description": desc, "input_schema": {"type": "object"}}],
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+
+        # Mock reviewer returning allow
+        def mock_transport(settings, data):
+            return {
+                "decision": "allow",
+                "risk": "low",
+                "policy_assessment": "safe",
+                "reason_code": "TOOL_SCHEMA_BENIGN",
+                "reason": "Legitimate tool documentation",
+            }
+
+        with patch.dict(os.environ, {"AUTOMODE_FAST_URL": "http://mock", "AUTOMODE_FAST_MODEL": "mock-model"}):
+            result = evaluate_dlp(
+                payload,
+                protocol="anthropic_messages",
+                upstream="https://api.anthropic.com",
+                identity=self.identity,
+                tool_schemas=[],
+                fast_transport=mock_transport,
+            )
+
+        self.assertEqual(result["final_decision"], "allow")
+        self.assertEqual(result["reason_code"], "TOOL_SCHEMA_BENIGN")
+        self.assertEqual(result["data_findings"][0]["disposition"], "approved_metadata")
+
+    def test_user_source_code_always_hard_alerts_to_external(self):
+        desc = "```python\ndef send_message():\n    pass\n```"
+        import hashlib
+        fp = hashlib.sha256(desc.encode("utf-8")).hexdigest()
+        schema = self.store.add_tool_schema("SendMessage", fp)
+
+        payload = {
+            "model": "claude-3-7-sonnet",
+            "tools": [{"name": "SendMessage", "description": desc}],
+            "messages": [{"role": "user", "content": "Here is my code:\n```python\nimport os\nprint(os.environ)\n```"}],
+        }
+
+        result = evaluate_dlp(
+            payload,
+            protocol="anthropic_messages",
+            upstream="https://api.anthropic.com",
+            identity=self.identity,
+            tool_schemas=[schema],
+        )
+
+        self.assertEqual(result["final_decision"], "alert")
+        self.assertEqual(result["reason_code"], "SENSITIVE_DATA_TO_EXTERNAL")
+        self.assertEqual(result["risk"], "high")
+
+    def test_credential_in_tool_description_never_exempted(self):
+        desc = "API tool: sk-abcdefghijklmnopqrstuvwxyz123456"
+        import hashlib
+        fp = hashlib.sha256(desc.encode("utf-8")).hexdigest()
+        schema = self.store.add_tool_schema("ExfilTool", fp)
+
+        payload = {
+            "model": "claude-3-7-sonnet",
+            "tools": [{"name": "ExfilTool", "description": desc}],
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+
+        result = evaluate_dlp(
+            payload,
+            protocol="anthropic_messages",
+            upstream="https://api.anthropic.com",
+            identity=self.identity,
+            tool_schemas=[schema],
+        )
+
+        self.assertEqual(result["final_decision"], "alert")
+        self.assertEqual(result["risk"], "critical")
+        # Credential finding must NOT be approved_metadata
+        for f in result["data_findings"]:
+            if f["category"] == "credential":
+                self.assertNotEqual(f.get("disposition"), "approved_metadata")
+
+    def test_session_detail_and_list_consistency_for_dlp(self):
+        sid = "sess-dlp-test"
+        t1 = self.store.create(
+            protocol="anthropic_messages", method="POST", path="/v1/messages",
+            payload={"messages": []}, headers={}, session_id=sid,
+            latest_user_text="", declared_tool_count=0,
+        )
+        self.store.save_pipeline(t1, {
+            "final_decision": "alert", "final_stage": "rules", "risk": "high",
+            "review_object": "outbound_request", "action_alignment": "normal",
+            "reason_code": "SENSITIVE_DATA_TO_EXTERNAL", "reason": "Sensitive outbound data.",
+            "authorization_evidence": [], "proposed_actions": [], "matched_rules": ["builtin-sensitive-external"],
+            "review_transcript": [], "total_latency_ms": 1,
+            "data_findings": [{"category": "source_code", "path": "$.tools[0].description", "confidence": "high", "fingerprint": "fp1", "snippet": "code", "detector": "source_or_config"}],
+            "destination": {"trust": "external"}, "policy_decision": "alert",
+            "stages": [{"stage": "rules", "status": "completed", "verdict": "ALWAYS_ALERT", "risk": "high", "reason_code": "SENSITIVE_DATA_TO_EXTERNAL", "reason": "Sensitive outbound data.", "latency_ms": 1, "action_alignment": "normal", "matched_rule_ids": [], "matched_rule_versions": []}],
+        })
+
+        t2 = self.store.create(
+            protocol="anthropic_messages", method="POST", path="/v1/messages",
+            payload={"messages": []}, headers={}, session_id=sid,
+            latest_user_text="", declared_tool_count=0,
+        )
+        self.store.save_pipeline(t2, {
+            "final_decision": "allow", "final_stage": "rules", "risk": "low",
+            "review_object": "outbound_request", "action_alignment": "normal",
+            "reason_code": "TOOL_SCHEMA_APPROVED", "reason": "Approved schema.",
+            "authorization_evidence": [], "proposed_actions": [], "matched_rules": [],
+            "review_transcript": [], "total_latency_ms": 1,
+            "data_findings": [{"category": "source_code", "path": "$.tools[0].description", "confidence": "high", "fingerprint": "fp1", "snippet": "code", "detector": "source_or_config", "disposition": "approved_metadata"}],
+            "destination": {"trust": "external"}, "policy_decision": "allow",
+            "stages": [{"stage": "rules", "status": "completed", "verdict": "SAFE", "risk": "low", "reason_code": "TOOL_SCHEMA_APPROVED", "reason": "Approved schema.", "latency_ms": 1, "action_alignment": "normal", "matched_rule_ids": [], "matched_rule_versions": []}],
+        })
+
+        # Check session() single query
+        session_obj = self.store.session(self.store.get(t1)["session_record_id"])
+        self.assertIsNotNone(session_obj)
+        self.assertTrue(session_obj["has_dlp_alert"])
+        self.assertEqual(session_obj["dlp_alert_count"], 1)
+        self.assertEqual(session_obj["latest_trace_decision"], "allow")
+        self.assertEqual(session_obj["dlp_findings_count"], 2)
+
+        # Check sessions() batch query
+        sessions_list = self.store.sessions()
+        matched_session = next(s for s in sessions_list if s["id"] == session_obj["id"])
+        self.assertEqual(matched_session["has_dlp_alert"], session_obj["has_dlp_alert"])
+        self.assertEqual(matched_session["dlp_alert_count"], session_obj["dlp_alert_count"])
+        self.assertEqual(matched_session["latest_trace_decision"], session_obj["latest_trace_decision"])
+        self.assertEqual(matched_session["dlp_findings_count"], session_obj["dlp_findings_count"])
+
+
 if __name__ == "__main__":
     unittest.main()
+

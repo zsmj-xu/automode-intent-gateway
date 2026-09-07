@@ -79,6 +79,24 @@ export function Alerts({ refresh, onOpenTrace }: { refresh: number; onOpenTrace?
     }
   }
 
+  async function handleProposeSchema(finding: any) {
+    const defaultName = finding.tool_name || (finding.path.includes('.tools[') ? 'SendMessage' : '')
+    const toolName = window.prompt('请输入提报的受控工具名称 (例如 SendMessage / TaskUpdate):', defaultName)
+    if (!toolName || !toolName.trim()) return
+    try {
+      await post('/api/tool-schemas', {
+        tool_name: toolName.trim(),
+        content_fingerprint: finding.fingerprint,
+        description_snippet: finding.snippet || '',
+        reason: '由安全管理员从告警提报受控工具 Schema',
+      })
+      window.alert(`已成功将工具 [${toolName.trim()}] 的 Schema 指纹提报为受控白名单！后续具有该指纹的请求将自动放行。`)
+      setLocalRefresh(v => v + 1)
+    } catch (err: any) {
+      window.alert(`提报失败: ${err?.message || '未知错误'}`)
+    }
+  }
+
   const STATUS_LABELS: Record<string, string> = {
     '': '全部状态',
     open: '开放',
@@ -179,12 +197,39 @@ export function Alerts({ refresh, onOpenTrace }: { refresh: number; onOpenTrace?
             {(!!selected.data_findings?.length || selected.alert_type === 'dlp') && (
               <div className="evidence" style={{ borderLeft: '3px solid var(--danger)', paddingLeft: '12px' }}>
                 <b>🛡️ 出站数据违规发现 (DLP)</b>
-                {selected.data_findings?.map((finding, index) => (
-                  <span key={`${finding.path}-${index}`}>
-                    <code>{finding.category}</code> {finding.path} · {finding.detector}
-                    {finding.snippet && <small style={{ display: 'block', color: '#f1c879', marginTop: '2px' }}>样例: {finding.snippet}</small>}
-                  </span>
-                ))}
+                {selected.data_findings?.map((finding, index) => {
+                  const isToolDesc = finding.path_type === 'tool_description' || finding.path.includes('.tools[')
+                  const canPropose = isToolDesc && finding.category === 'source_code'
+                  return (
+                    <div key={`${finding.path}-${index}`} style={{ margin: '6px 0', padding: '6px 8px', background: 'rgba(255,255,255,0.02)', borderRadius: '4px' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px', flexWrap: 'wrap' }}>
+                        <span>
+                          <code>{finding.category}</code> {finding.path} · {finding.detector}
+                          {isToolDesc && (
+                            <span style={{ marginLeft: '6px', fontSize: '11px', background: 'rgba(59, 130, 246, 0.15)', color: '#60a5fa', padding: '1px 5px', borderRadius: '4px' }}>
+                              工具说明 {finding.tool_name ? `(${finding.tool_name})` : ''}
+                            </span>
+                          )}
+                          {finding.disposition === 'approved_metadata' && (
+                            <span style={{ marginLeft: '6px', fontSize: '11px', background: 'rgba(34, 197, 94, 0.15)', color: '#4ade80', padding: '1px 5px', borderRadius: '4px' }}>
+                              已登记受控 Schema
+                            </span>
+                          )}
+                        </span>
+                        {canPropose && (
+                          <button
+                            className="secondary compact"
+                            style={{ fontSize: '11px', padding: '2px 8px', color: '#60a5fa', borderColor: '#3b82f6' }}
+                            onClick={() => handleProposeSchema(finding)}
+                          >
+                            + 提报为受控 Schema
+                          </button>
+                        )}
+                      </div>
+                      {finding.snippet && <small style={{ display: 'block', color: '#f1c879', marginTop: '4px' }}>样例: {finding.snippet}</small>}
+                    </div>
+                  )
+                })}
                 {selected.evidence?.length > 0 && (
                   <div style={{ marginTop: '8px' }}>
                     <small style={{ color: 'var(--muted)' }}>脱敏证据:</small>

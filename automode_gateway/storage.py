@@ -907,16 +907,20 @@ class TraceStore:
                 placeholders = ", ".join("?" for _ in session_ids)
                 dlp_info_rows = connection.execute(
                     f"""SELECT t.session_record_id, r.data_findings_json, r.policy_decision,
-                               r.review_object, a.id AS alert_id
+                               r.review_object, a.id AS alert_id, t.created_at, r.final_decision
                         FROM traces t
                         LEFT JOIN classification_runs r ON r.trace_id = t.id
                         LEFT JOIN alerts a ON a.trace_id = t.id
-                        WHERE t.session_record_id IN ({placeholders})""",
+                        WHERE t.session_record_id IN ({placeholders})
+                        ORDER BY t.created_at ASC""",
                     session_ids,
                 ).fetchall()
 
                 session_dlp_map: dict[str, dict[str, Any]] = {
-                    sid: {"findings_count": 0, "categories": set(), "has_dlp_alert": False, "has_intent_alert": False}
+                    sid: {
+                        "findings_count": 0, "categories": set(), "has_dlp_alert": False,
+                        "has_intent_alert": False, "dlp_alert_count": 0, "latest_trace_decision": "allow",
+                    }
                     for sid in session_ids
                 }
                 for d_row in dlp_info_rows:
@@ -937,8 +941,11 @@ class TraceStore:
                             pass
                     review_object = d_row[3]
                     has_alert = bool(d_row[4])
+                    final_decision = d_row[6] or d_row[2] or "allow"
+                    session_dlp_map[sid]["latest_trace_decision"] = final_decision
                     if review_object == "outbound_request" and d_row[2] == "alert":
                         session_dlp_map[sid]["has_dlp_alert"] = True
+                        session_dlp_map[sid]["dlp_alert_count"] += 1
                     elif has_alert:
                         session_dlp_map[sid]["has_intent_alert"] = True
 
@@ -960,6 +967,8 @@ class TraceStore:
                     row["dlp_findings_count"] = meta.get("findings_count", 0)
                     row["dlp_categories"] = sorted(meta.get("categories", set()))
                     row["has_dlp_alert"] = meta.get("has_dlp_alert", False)
+                    row["dlp_alert_count"] = meta.get("dlp_alert_count", 0)
+                    row["latest_trace_decision"] = meta.get("latest_trace_decision", "allow")
                     row["has_intent_alert"] = meta.get("has_intent_alert", False)
                     row["intent_risk"] = tool_risks.get(sid, "low")
                     row["risk_intent_summary"] = self.session_risk_summary(sid)
@@ -985,11 +994,77 @@ class TraceStore:
     def session(self, session_id: str) -> dict[str, Any] | None:
         with self._connect() as connection:
             row = connection.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
-        if row is None:
-            return None
-        value = _json_row(row, ("protocols_json", "models_json", "authorization_json"))
-        value["risk_intent_summary"] = self.session_risk_summary(session_id)
-        return value
+            if row is None:
+                return None
+            value = _json_row(row, ("protocols_json", "models_json", "authorization_json"))
+            return self._enrich_session_dlp_facts(connection, value)
+
+    def _enrich_session_dlp_facts(self, connection: sqlite3.Connection, session_data: dict[str, Any]) -> dict[str, Any]:
+        sid = session_data["id"]
+        dlp_info_rows = connection.execute(
+            """SELECT t.id, t.created_at, r.data_findings_json, r.policy_decision,
+                      r.review_object, (SELECT id FROM alerts a WHERE a.trace_id = t.id LIMIT 1) AS alert_id,
+                      r.final_decision
+               FROM traces t
+               LEFT JOIN classification_runs r ON r.trace_id = t.id
+               WHERE t.session_record_id = ?
+               ORDER BY t.created_at ASC""",
+            (sid,),
+        ).fetchall()
+
+        findings_count = 0
+        categories: set[str] = set()
+        has_dlp_alert = False
+        dlp_alert_count = 0
+        has_intent_alert = False
+        latest_decision = "allow"
+
+        for d_row in dlp_info_rows:
+            findings_raw = d_row[2]
+            decision = d_row[3]
+            review_object = d_row[4]
+            has_alert = bool(d_row[5])
+            final_decision = d_row[6] or decision or "allow"
+            latest_decision = final_decision
+
+            if findings_raw:
+                try:
+                    findings = json.loads(findings_raw)
+                    if isinstance(findings, list) and findings:
+                        findings_count += len(findings)
+                        for f in findings:
+                            cat = f.get("category")
+                            if cat:
+                                categories.add(str(cat))
+                except Exception:
+                    pass
+            if review_object == "outbound_request" and decision == "alert":
+                has_dlp_alert = True
+                dlp_alert_count += 1
+            elif has_alert:
+                has_intent_alert = True
+
+        action_rows = connection.execute(
+            """SELECT a.risk FROM traces t
+               JOIN tool_actions a ON a.trace_id=t.id
+               WHERE t.session_record_id = ?""",
+            (sid,),
+        ).fetchall()
+        intent_risk = "low"
+        for a_row in action_rows:
+            risk_val = a_row[0]
+            if risk_val in _RISK_ORDER and _RISK_ORDER.index(risk_val) > _RISK_ORDER.index(intent_risk):
+                intent_risk = risk_val
+
+        session_data["dlp_findings_count"] = findings_count
+        session_data["dlp_categories"] = sorted(categories)
+        session_data["has_dlp_alert"] = has_dlp_alert
+        session_data["dlp_alert_count"] = dlp_alert_count
+        session_data["latest_trace_decision"] = latest_decision
+        session_data["has_intent_alert"] = has_intent_alert
+        session_data["intent_risk"] = intent_risk
+        session_data["risk_intent_summary"] = self.session_risk_summary(sid)
+        return session_data
 
     def session_baseline_for_trace(self, trace_id: str) -> dict[str, Any] | None:
         """The session-wide authorization baseline accumulated for a trace's session."""
@@ -1497,6 +1572,90 @@ class TraceStore:
             _audit(connection, "detector.enabled" if enabled else "detector.disabled", "detector", detector_id, {})
         detectors = {d["id"]: d for d in self.get_detectors()}
         return detectors[detector_id]
+
+    # Controlled Tool Schemas management -----------------------------------------
+    def get_tool_schemas(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            row = connection.execute("SELECT value_json FROM settings WHERE key='tool_schemas'").fetchone()
+        schemas = list(json.loads(row[0])) if row and row[0] else []
+        return schemas
+
+    def add_tool_schema(
+        self,
+        tool_name: str,
+        content_fingerprint: str,
+        *,
+        agent_id: str = "claude_code",
+        schema_version: str = "v1.0",
+        description_snippet: str = "",
+        reason: str = "内置受控工具",
+    ) -> dict[str, Any]:
+        tool_name = tool_name.strip()
+        content_fingerprint = content_fingerprint.strip().lower()
+        if not tool_name or not content_fingerprint:
+            raise ValueError("tool_name and content_fingerprint are required")
+        if len(content_fingerprint) != 64:
+            raise ValueError("content_fingerprint must be a 64-character SHA-256 hash")
+
+        schema_id = f"schema_{uuid.uuid4().hex[:8]}"
+        new_item = {
+            "id": schema_id,
+            "agent_id": agent_id.strip() or "claude_code",
+            "tool_name": tool_name,
+            "schema_version": schema_version.strip() or "v1.0",
+            "content_fingerprint": content_fingerprint,
+            "description_snippet": description_snippet.strip()[:100],
+            "reason": reason.strip() or "内置受控工具",
+            "enabled": True,
+            "created_at": _now(),
+        }
+
+        with self._connect() as connection:
+            current = self.get_tool_schemas()
+            for item in current:
+                if item.get("tool_name") == tool_name and item.get("content_fingerprint") == content_fingerprint:
+                    item["enabled"] = True
+                    if reason:
+                        item["reason"] = reason
+                    connection.execute(
+                        "INSERT INTO settings (key, value_json, updated_at) VALUES ('tool_schemas', ?, ?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at",
+                        (json.dumps(current, ensure_ascii=False), _now()),
+                    )
+                    return item
+            current.append(new_item)
+            connection.execute(
+                "INSERT INTO settings (key, value_json, updated_at) VALUES ('tool_schemas', ?, ?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at",
+                (json.dumps(current, ensure_ascii=False), _now()),
+            )
+            _audit(connection, "tool_schema.created", "tool_schema", schema_id, {"tool_name": tool_name, "fingerprint": content_fingerprint})
+        return new_item
+
+    def set_tool_schema_enabled(self, schema_id: str, enabled: bool) -> dict[str, Any]:
+        with self._connect() as connection:
+            current = self.get_tool_schemas()
+            target = next((item for item in current if item["id"] == schema_id), None)
+            if target is None:
+                raise KeyError(f"tool schema not found: {schema_id}")
+            target["enabled"] = bool(enabled)
+            connection.execute(
+                "INSERT INTO settings (key, value_json, updated_at) VALUES ('tool_schemas', ?, ?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at",
+                (json.dumps(current, ensure_ascii=False), _now()),
+            )
+            _audit(connection, "tool_schema.enabled" if enabled else "tool_schema.disabled", "tool_schema", schema_id, {})
+        return target
+
+    def delete_tool_schema(self, schema_id: str) -> bool:
+        with self._connect() as connection:
+            current = self.get_tool_schemas()
+            filtered = [item for item in current if item["id"] != schema_id]
+            if len(filtered) == len(current):
+                raise KeyError(f"tool schema not found: {schema_id}")
+            connection.execute(
+                "INSERT INTO settings (key, value_json, updated_at) VALUES ('tool_schemas', ?, ?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at",
+                (json.dumps(filtered, ensure_ascii=False), _now()),
+            )
+            _audit(connection, "tool_schema.deleted", "tool_schema", schema_id, {})
+        return True
 
     def record_test_run(
         self,

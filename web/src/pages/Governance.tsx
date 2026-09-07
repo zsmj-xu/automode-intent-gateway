@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react'
 import { Beaker, ChevronDown, ChevronRight, Database, Plus, Save, ShieldCheck, Trash2, X } from 'lucide-react'
-import type { Destination, DetectorItem, DLPPolicy, Json, Rule } from '../types'
+import type { Destination, DetectorItem, DLPPolicy, Json, Rule, ToolSchemaItem } from '../types'
 import { useLoad } from '../lib/hooks'
 import { formatTime, friendlyError } from '../lib/format'
 import { api, del, patch, post } from '../api'
@@ -25,6 +25,7 @@ export function Governance({ refresh }: { refresh: number }) {
   const policies = useLoad<{ data: DLPPolicy[] }>(`/api/dlp-policies?v=${version}`, version).data?.data || []
   const targets = useLoad<{ data: Destination[] }>(`/api/destinations?v=${version}`, version).data?.data || []
   const detectors = useLoad<{ data: DetectorItem[] }>(`/api/detectors?v=${version}`, version).data?.data || []
+  const toolSchemas = useLoad<{ data: ToolSchemaItem[] }>(`/api/tool-schemas?v=${version}`, version).data?.data || []
   const legacy = useLoad<{ data: Rule[] }>(`/api/rules?v=${version}`, version).data?.data || []
 
   const [policyText, setPolicyText] = useState('凭据、PII 或源码发往外部模型时告警。')
@@ -53,6 +54,15 @@ export function Governance({ refresh }: { refresh: number }) {
       return { valid: false, error: (err as Error).message }
     }
   }, [customDet.pattern, customTestInput])
+
+  const [showAddSchema, setShowAddSchema] = useState(false)
+  const [newSchema, setNewSchema] = useState({
+    tool_name: '',
+    content_fingerprint: '',
+    agent_id: 'claude_code',
+    schema_version: 'v1.0',
+    reason: '受控内置工具',
+  })
 
   const [target, setTarget] = useState({ name: '', model_pattern: '', provider: '', region: '', trust: 'trusted' as 'trusted' | 'external' })
   const [busy, setBusy] = useState('')
@@ -183,6 +193,50 @@ export function Governance({ refresh }: { refresh: number }) {
       await post(`/api/rules/${row.id}/${row.enabled ? 'disable' : 'enable'}`, {})
       setLocalRefresh(v => v + 1)
     } finally { setBusy('') }
+  }
+
+  async function saveToolSchema() {
+    if (!newSchema.tool_name.trim() || !newSchema.content_fingerprint.trim()) {
+      setMessage('请填写工具名称和 64 位 SHA-256 指纹')
+      return
+    }
+    setBusy('add-schema'); setMessage('')
+    try {
+      await post('/api/tool-schemas', newSchema)
+      setMessage(`受控工具 Schema「${newSchema.tool_name}」已添加并启用`)
+      setNewSchema({ tool_name: '', content_fingerprint: '', agent_id: 'claude_code', schema_version: 'v1.0', reason: '受控内置工具' })
+      setShowAddSchema(false)
+      setLocalRefresh(v => v + 1)
+    } catch (err) {
+      setMessage(friendlyError(err))
+    } finally {
+      setBusy('')
+    }
+  }
+
+  async function toggleToolSchema(item: ToolSchemaItem) {
+    setBusy(`schema-${item.id}`)
+    try {
+      await patch(`/api/tool-schemas/${item.id}`, { enabled: !item.enabled })
+      setLocalRefresh(v => v + 1)
+    } catch (err) {
+      setMessage(friendlyError(err))
+    } finally {
+      setBusy('')
+    }
+  }
+
+  async function deleteToolSchema(schemaId: string) {
+    setBusy(`del-schema-${schemaId}`)
+    try {
+      await del(`/api/tool-schemas/${schemaId}`)
+      setMessage('受控工具 Schema 已移除')
+      setLocalRefresh(v => v + 1)
+    } catch (err) {
+      setMessage(friendlyError(err))
+    } finally {
+      setBusy('')
+    }
   }
 
   return (
@@ -329,6 +383,84 @@ export function Governance({ refresh }: { refresh: number }) {
               </div>
             )
           })}
+        </div>
+      </section>
+
+      <section className="panel">
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px', flexWrap: 'wrap', gap: '8px' }}>
+          <PanelTitle
+            title="受控工具 Schema 白名单 (Controlled Tool Schemas)"
+            subtitle="针对来源固定、版本受控的内置 Agent 工具定义（如 Claude Code 内置工具）；录入 SHA-256 指纹后，固定代码描述将不再触发误报告警"
+          />
+          <button className="secondary compact" onClick={() => setShowAddSchema(!showAddSchema)}>
+            <Plus size={14} /> {showAddSchema ? '收起表单' : '录入受控 Schema'}
+          </button>
+        </div>
+
+        {showAddSchema && (
+          <div className="detector-card" style={{ marginBottom: '14px', border: '1px solid var(--accent)', padding: '12px' }}>
+            <b style={{ color: '#f8fafc' }}>录入受控工具 Schema 指纹</b>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px', marginTop: '8px' }}>
+              <label>工具名称<input placeholder="例如 SendMessage / TaskUpdate" value={newSchema.tool_name} onChange={e => setNewSchema(v => ({ ...v, tool_name: e.target.value }))} /></label>
+              <label>Agent 标识<input placeholder="例如 claude_code" value={newSchema.agent_id} onChange={e => setNewSchema(v => ({ ...v, agent_id: e.target.value }))} /></label>
+            </div>
+            <label style={{ marginTop: '6px', display: 'block' }}>
+              内容 SHA-256 指纹 (64位)
+              <input placeholder="64 位十六进制哈希，例如 f2ad28a6de17ba4bca50a4ce577c4604f8ccf3a2d93c30894bbf7de332d9df28" value={newSchema.content_fingerprint} onChange={e => setNewSchema(v => ({ ...v, content_fingerprint: e.target.value }))} />
+            </label>
+            <label style={{ marginTop: '6px', display: 'block' }}>
+              豁免原因说明
+              <input placeholder="例如 Claude Code 官方内置工具定义" value={newSchema.reason} onChange={e => setNewSchema(v => ({ ...v, reason: e.target.value }))} />
+            </label>
+            <div style={{ marginTop: '10px', display: 'flex', gap: '8px' }}>
+              <button className="primary compact" disabled={!!busy || !newSchema.tool_name.trim() || !newSchema.content_fingerprint.trim()} onClick={saveToolSchema}>
+                {busy === 'add-schema' ? '保存中…' : '保存并生效'}
+              </button>
+              <button className="secondary compact" onClick={() => setShowAddSchema(false)}>取消</button>
+            </div>
+          </div>
+        )}
+
+        <div className="rule-list" style={{ marginTop: '10px' }}>
+          {toolSchemas.map(item => (
+            <article key={item.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '10px' }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                  <b>{item.tool_name}</b>
+                  <span style={{ fontSize: '11px', background: 'rgba(59, 130, 246, 0.15)', color: '#60a5fa', padding: '1px 6px', borderRadius: '4px' }}>{item.agent_id}</span>
+                  <code style={{ fontSize: '11px' }} title={item.content_fingerprint}>
+                    SHA: {item.content_fingerprint.slice(0, 12)}...{item.content_fingerprint.slice(-8)}
+                  </code>
+                </div>
+                <div style={{ fontSize: '12px', color: 'var(--muted)', marginTop: '3px' }}>
+                  {item.reason || '受控内置工具'}
+                  {item.description_snippet && <span> · 样例: <i>{item.description_snippet.slice(0, 50)}...</i></span>}
+                </div>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <button
+                  className={item.enabled ? 'toggle on' : 'toggle'}
+                  role="switch"
+                  aria-checked={item.enabled}
+                  aria-label={`${item.enabled ? '禁用' : '启用'} ${item.tool_name}`}
+                  disabled={busy === `schema-${item.id}`}
+                  onClick={() => toggleToolSchema(item)}
+                >
+                  <i />
+                </button>
+                <button
+                  className="icon-button"
+                  aria-label="删除"
+                  title="删除此 Schema"
+                  disabled={busy === `del-schema-${item.id}`}
+                  onClick={() => deleteToolSchema(item.id)}
+                >
+                  <Trash2 size={15} />
+                </button>
+              </div>
+            </article>
+          ))}
+          {!toolSchemas.length && <Empty text="尚未录入受控工具 Schema 白名单；可在告警列表一键提报或在此手动添加" />}
         </div>
       </section>
 

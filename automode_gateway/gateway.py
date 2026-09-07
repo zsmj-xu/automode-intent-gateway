@@ -247,17 +247,19 @@ class Gateway:
         identity: dict[str, Any],
     ) -> None:
         try:
-            targets, policies, prompts, disabled_detectors, custom_detectors = await asyncio.gather(
+            targets, policies, prompts, disabled_detectors, custom_detectors, tool_schemas = await asyncio.gather(
                 asyncio.to_thread(self.store.list_destinations),
                 asyncio.to_thread(self.store.list_dlp_policies, True),
                 asyncio.to_thread(self.store.get_prompts),
                 asyncio.to_thread(self.store.get_disabled_detectors),
                 asyncio.to_thread(self.store.get_custom_detectors),
+                asyncio.to_thread(self.store.get_tool_schemas),
             )
             result = await asyncio.to_thread(
                 evaluate_dlp, payload, protocol=protocol, upstream=self.upstream,
                 identity=identity, targets=targets, policies=policies,
                 disabled_detectors=disabled_detectors, custom_detectors=custom_detectors,
+                tool_schemas=tool_schemas,
                 prompts=prompts,
             )
             result["evidence_id"] = await asyncio.to_thread(

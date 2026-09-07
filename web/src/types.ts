@@ -22,9 +22,23 @@ export interface Session {
   dlp_findings_count?: number
   dlp_categories?: string[]
   has_dlp_alert?: boolean
+  dlp_alert_count?: number
+  latest_trace_decision?: string
   has_intent_alert?: boolean
   intent_risk?: Risk
   risk_intent_summary?: RiskIntentSummary | null
+}
+
+export interface ToolSchemaItem {
+  id: string
+  agent_id: string
+  tool_name: string
+  schema_version: string
+  content_fingerprint: string
+  description_snippet: string
+  reason: string
+  enabled: boolean
+  created_at: string
 }
 
 export interface RiskIntentSummary {
@@ -76,6 +90,11 @@ export interface DataFinding {
   fingerprint: string
   snippet: string
   detector: string
+  canonical_fingerprint?: string
+  path_type?: 'tool_description' | 'request_body' | string
+  disposition?: 'approved_metadata' | 'active_alert' | string
+  schema_id?: string | null
+  tool_name?: string | null
 }
 
 export interface Destination {

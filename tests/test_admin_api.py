@@ -344,6 +344,56 @@ class AdminApiTests(unittest.IsolatedAsyncioTestCase):
             data = await response.json()
             self.assertTrue(data["deleted"])
 
+    async def test_tool_schemas_admin_api(self):
+        # 1. GET initial list
+        async with self.client.get(self.server.make_url("/api/tool-schemas")) as response:
+            self.assertEqual(response.status, 200)
+            data = (await response.json())["data"]
+            self.assertEqual(data, [])
+
+        # 2. POST invalid body (missing required fields)
+        async with self.client.post(self.server.make_url("/api/tool-schemas"), json={"tool_name": "Test"}) as response:
+            self.assertEqual(response.status, 400)
+
+        # 3. POST valid tool schema
+        fp = "f2ad28a6de17ba4bca50a4ce577c4604f8ccf3a2d93c30894bbf7de332d9df28"
+        payload = {
+            "tool_name": "SendMessage",
+            "content_fingerprint": fp,
+            "agent_id": "claude_code",
+            "reason": "官方内置工具",
+        }
+        async with self.client.post(self.server.make_url("/api/tool-schemas"), json=payload) as response:
+            self.assertEqual(response.status, 201)
+            created = (await response.json())["data"]
+            schema_id = created["id"]
+            self.assertEqual(created["tool_name"], "SendMessage")
+            self.assertEqual(created["content_fingerprint"], fp)
+            self.assertTrue(created["enabled"])
+
+        # 4. GET list with created item
+        async with self.client.get(self.server.make_url("/api/tool-schemas")) as response:
+            self.assertEqual(response.status, 200)
+            data = (await response.json())["data"]
+            self.assertEqual(len(data), 1)
+            self.assertEqual(data[0]["id"], schema_id)
+
+        # 5. PATCH disable
+        async with self.client.patch(self.server.make_url(f"/api/tool-schemas/{schema_id}"), json={"enabled": False}) as response:
+            self.assertEqual(response.status, 200)
+            updated = (await response.json())["data"]
+            self.assertFalse(updated["enabled"])
+
+        # 6. DELETE
+        async with self.client.delete(self.server.make_url(f"/api/tool-schemas/{schema_id}")) as response:
+            self.assertEqual(response.status, 200)
+            self.assertTrue((await response.json())["deleted"])
+
+        # 7. GET list after delete
+        async with self.client.get(self.server.make_url("/api/tool-schemas")) as response:
+            self.assertEqual(response.status, 200)
+            self.assertEqual((await response.json())["data"], [])
+
 
 class AdminAuthTests(unittest.IsolatedAsyncioTestCase):
     async def test_non_loopback_binding_requires_and_enforces_token(self):
@@ -388,3 +438,4 @@ class AdminAuthTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

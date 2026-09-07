@@ -21,6 +21,32 @@ IDENTITY_HEADERS = {
 }
 
 
+def canonical_schema_fingerprint(description: str) -> str:
+    cleaned = re.sub(r"\s+", " ", description).strip()
+    import hashlib
+    return hashlib.sha256(cleaned.encode("utf-8")).hexdigest()
+
+
+def is_tool_description_path(path: str) -> bool:
+    return bool(re.match(r"^\$\.tools\[\d+\]", path))
+
+
+def get_tool_name_from_path(payload: dict[str, Any], path: str) -> str | None:
+    m = re.match(r"^\$\.tools\[(\d+)\]", path)
+    if not m:
+        return None
+    try:
+        idx = int(m.group(1))
+        tools = payload.get("tools")
+        if isinstance(tools, list) and 0 <= idx < len(tools):
+            item = tools[idx]
+            if isinstance(item, dict):
+                return item.get("name") or (item.get("function") or {}).get("name")
+    except Exception:
+        pass
+    return None
+
+
 @dataclass(frozen=True)
 class DataFinding:
     category: str
@@ -31,9 +57,15 @@ class DataFinding:
     fingerprint: str
     snippet: str
     detector: str
+    canonical_fingerprint: str = ""
+    path_type: str = "request_body"
+    disposition: str = "active_alert"
+    schema_id: str | None = None
+    tool_name: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
 
 
 def trusted_identity(headers: dict[str, str], peer: str | None, trusted_cidrs: str | None) -> dict[str, Any]:
@@ -162,7 +194,13 @@ def scan_payload(
     for finding in findings:
         key = (finding.category, finding.path, finding.start, finding.end, finding.fingerprint)
         unique[key] = finding
-    return [item.to_dict() for item in unique.values()]
+    output: list[dict[str, Any]] = []
+    for item in unique.values():
+        d = item.to_dict()
+        if isinstance(payload, dict) and d.get("path_type") == "tool_description":
+            d["tool_name"] = get_tool_name_from_path(payload, d["path"])
+        output.append(d)
+    return output
 
 
 def _walk_strings(value: Any, path: str = "$") -> Iterable[tuple[str, str]]:
@@ -221,10 +259,26 @@ def _scan_text(
             matches.append(("admin_keyword", match.start(), match.end(), f"keyword:{policy_id}", match.group(0)))
 
     result: list[DataFinding] = []
+    path_type = "tool_description" if is_tool_description_path(path) else "request_body"
     for category, start, end, detector, raw in matches:
         fingerprint = hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()
+        canonical_fp = canonical_schema_fingerprint(raw)
         snippet = _safe_snippet(text, start, end, category)
-        result.append(DataFinding(category, path, "high", start, end, fingerprint, snippet, detector))
+        result.append(
+            DataFinding(
+                category=category,
+                path=path,
+                confidence="high",
+                start=start,
+                end=end,
+                fingerprint=fingerprint,
+                snippet=snippet,
+                detector=detector,
+                canonical_fingerprint=canonical_fp,
+                path_type=path_type,
+                disposition="active_alert",
+            )
+        )
     return result
 
 
@@ -263,11 +317,14 @@ def redact_payload(payload: Any, findings: list[dict[str, Any]]) -> Any:
         current = _path_get(result, path)
         if not isinstance(current, str):
             continue
-        if any(item["category"] == "source_code" for item in path_findings):
+        active_findings = [item for item in path_findings if item.get("disposition") != "approved_metadata"]
+        if not active_findings:
+            continue
+        if any(item["category"] == "source_code" for item in active_findings):
             _path_set(result, path, "[REDACTED:SOURCE_CODE]")
             continue
         text = current
-        for item in sorted(path_findings, key=lambda value: int(value["start"]), reverse=True):
+        for item in sorted(active_findings, key=lambda value: int(value["start"]), reverse=True):
             start, end = int(item["start"]), int(item["end"])
             text = text[:start] + f"[REDACTED:{str(item['category']).upper()}]" + text[end:]
         _path_set(result, path, text)
@@ -322,6 +379,7 @@ def evaluate_dlp(
     policies: Iterable[dict[str, Any]] = (),
     disabled_detectors: Iterable[str] = (),
     custom_detectors: Iterable[dict[str, Any]] = (),
+    tool_schemas: Iterable[dict[str, Any]] = (),
     prompts: dict[str, str] | None = None,
     fast_transport: Transport | None = None,
     deep_transport: Transport | None = None,
@@ -330,13 +388,46 @@ def evaluate_dlp(
     policies = list(policies)
     findings = scan_payload(payload, policies, disabled_detectors=disabled_detectors, custom_detectors=custom_detectors)
     destination = resolve_destination(str(payload.get("model") or "") or None, upstream, targets)
+
+    # 1. Match findings against active tool schemas
+    active_schemas = [s for s in tool_schemas if s.get("enabled", True)]
+    for f in findings:
+        if f.get("path_type") == "tool_description":
+            # Security boundary: credentials and PII can NEVER be exempted as metadata!
+            if f.get("category") not in ("credential", "pii"):
+                for s in active_schemas:
+                    s_fp = s.get("content_fingerprint")
+                    if s_fp and s_fp in (f.get("fingerprint"), f.get("canonical_fingerprint")):
+                        f["disposition"] = "approved_metadata"
+                        f["schema_id"] = s.get("id")
+                        break
+
+    unapproved_findings = [f for f in findings if f.get("disposition") != "approved_metadata"]
+    approved_findings = [f for f in findings if f.get("disposition") == "approved_metadata"]
+
     categories = sorted({str(item["category"]) for item in findings})
+    unapproved_categories = sorted({str(item["category"]) for item in unapproved_findings})
     purpose = _request_purpose(payload, protocol)
     matched: list[str] = []
-    hard_alert = bool(findings and destination["trust"] == "external")
-    if hard_alert:
-        matched.append("builtin-sensitive-external")
+
+    # 2. Hard alert & review decision for external destination
+    hard_alert = False
     review_match = False
+
+    if destination["trust"] == "external":
+        has_critical_or_body = any(
+            f.get("category") in ("credential", "pii") or f.get("path_type") != "tool_description"
+            for f in unapproved_findings
+        )
+        if has_critical_or_body:
+            hard_alert = True
+            matched.append("builtin-sensitive-external")
+        elif unapproved_findings:
+            # Unapproved tool description code goes to LLM Reviewer
+            review_match = True
+            matched.append("unapproved-tool-schema-review")
+
+    # 3. Custom policies
     for policy in policies:
         if not policy.get("enabled", True) or not _policy_matches(policy, categories, destination, identity, payload):
             continue
@@ -345,10 +436,17 @@ def evaluate_dlp(
             hard_alert = True
         elif policy.get("effect") == "review":
             review_match = True
+
     decision = "alert" if hard_alert or review_match else "allow"
-    reason_code = "SENSITIVE_DATA_TO_EXTERNAL" if hard_alert and "builtin-sensitive-external" in matched else "DLP_POLICY_MATCH" if matched else "NO_DLP_POLICY_MATCH"
-    risk = "critical" if "credential" in categories and decision == "alert" else "high" if decision == "alert" else "medium" if findings else "low"
-    reason = "Sensitive outbound data matched an external-destination policy." if decision == "alert" else "No outbound data policy requires attention."
+    if approved_findings and not unapproved_findings and not hard_alert and not review_match:
+        reason_code = "TOOL_SCHEMA_APPROVED"
+        reason = "Outbound tool schemas matched approved controlled metadata."
+    else:
+        reason_code = "SENSITIVE_DATA_TO_EXTERNAL" if hard_alert and "builtin-sensitive-external" in matched else "TOOL_SCHEMA_REVIEW" if review_match and not hard_alert else "DLP_POLICY_MATCH" if matched else "NO_DLP_POLICY_MATCH"
+        reason = "Sensitive outbound data matched an external-destination policy." if decision == "alert" else "No outbound data policy requires attention."
+
+    risk = "critical" if "credential" in unapproved_categories and decision == "alert" else "high" if decision == "alert" else "medium" if unapproved_findings else "low"
+
     stages: list[dict[str, Any]] = [{
         "stage": "rules", "status": "completed", "verdict": "ALWAYS_ALERT" if hard_alert else "RISKY" if review_match else "SAFE",
         "risk": risk, "reason_code": reason_code, "reason": reason, "latency_ms": (time.perf_counter() - started) * 1000,
@@ -357,6 +455,7 @@ def evaluate_dlp(
     }]
     final_stage = "rules"
     semantic_status = "not_needed"
+
     if review_match and not hard_alert:
         semantic_status = "needs_review"
         signals = _review_signals(findings, destination, identity)
@@ -365,18 +464,25 @@ def evaluate_dlp(
         final = fast
         if fast.status == "completed" and fast.verdict == "allow":
             decision, semantic_status = "allow", "resolved"
+            for f in unapproved_findings:
+                if f.get("path_type") == "tool_description":
+                    f["disposition"] = "approved_metadata"
         else:
             deep = LLMClassifier(ReviewerSettings.from_env("deep", prompt_override=prompts), deep_transport).run(signals, stages, review_object="outbound_dlp")
             stages.append(deep.to_dict())
             final = deep
             if deep.status == "completed" and deep.verdict == "allow":
                 decision, semantic_status = "allow", "resolved"
+                for f in unapproved_findings:
+                    if f.get("path_type") == "tool_description":
+                        f["disposition"] = "approved_metadata"
             elif deep.status == "completed" and deep.verdict == "reject":
                 decision, semantic_status = "alert", "resolved"
             else:
                 decision, semantic_status = "alert", "needs_review"
         final_stage, reason_code, reason = final.stage, final.reason_code, final.reason
         risk = final.risk if final.status == "completed" else "high"
+
     return {
         "final_decision": decision, "policy_decision": decision, "final_stage": final_stage, "risk": risk,
         "decision": decision, "classifier_stage": final_stage, "reason_codes": [reason_code],
@@ -417,7 +523,20 @@ def _policy_matches(policy: dict[str, Any], categories: list[str], destination: 
 
 
 def _review_signals(findings: list[dict[str, Any]], destination: dict[str, Any], identity: dict[str, Any]) -> list[dict[str, Any]]:
-    return [{"type": "dlp_finding", "category": item["category"], "path": item["path"], "confidence": item["confidence"], "snippet": item["snippet"]} for item in findings] + [
+    return [
+        {
+            "type": "dlp_finding",
+            "category": item["category"],
+            "path": item["path"],
+            "path_type": item.get("path_type", "request_body"),
+            "tool_name": item.get("tool_name"),
+            "disposition": item.get("disposition", "active_alert"),
+            "confidence": item["confidence"],
+            "snippet": item["snippet"],
+        }
+        for item in findings
+    ] + [
         {"type": "destination", **destination},
         {"type": "identity", **identity},
     ]
+

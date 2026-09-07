@@ -49,6 +49,10 @@ def register_admin_routes(app: web.Application, store: TraceStore) -> None:
     routes.add_post("/api/detectors", create_detector_handler)
     routes.add_patch("/api/detectors/{detector_id}", update_detector_handler)
     routes.add_delete("/api/detectors/{detector_id}", delete_detector_handler)
+    routes.add_get("/api/tool-schemas", get_tool_schemas_handler)
+    routes.add_post("/api/tool-schemas", create_tool_schema_handler)
+    routes.add_patch("/api/tool-schemas/{schema_id}", update_tool_schema_handler)
+    routes.add_delete("/api/tool-schemas/{schema_id}", delete_tool_schema_handler)
     routes.add_get("/api/rules", rules)
     routes.add_post("/api/rules/compile", compile_rule)
     routes.add_post("/api/rules/test", test_rule)
@@ -202,6 +206,59 @@ async def delete_detector_handler(request: web.Request) -> web.Response:
     try:
         await _store_call(request, "delete_custom_detector", detector_id)
         return web.json_response({"deleted": True, "id": detector_id})
+    except KeyError as exc:
+        raise web.HTTPNotFound(text=str(exc)) from exc
+
+
+async def get_tool_schemas_handler(request: web.Request) -> web.Response:
+    data = await _store_call(request, "get_tool_schemas")
+    return web.json_response({"data": data})
+
+
+async def create_tool_schema_handler(request: web.Request) -> web.Response:
+    body = await _json(request)
+    tool_name = str(body.get("tool_name", "")).strip()
+    content_fingerprint = str(body.get("content_fingerprint", "")).strip()
+    agent_id = str(body.get("agent_id", "claude_code")).strip()
+    schema_version = str(body.get("schema_version", "v1.0")).strip()
+    description_snippet = str(body.get("description_snippet", "")).strip()
+    reason = str(body.get("reason", "受控内置工具")).strip()
+    if not tool_name or not content_fingerprint:
+        raise web.HTTPBadRequest(text="tool_name and content_fingerprint are required")
+    try:
+        created = await _store_call(
+            request,
+            "add_tool_schema",
+            tool_name,
+            content_fingerprint,
+            agent_id=agent_id,
+            schema_version=schema_version,
+            description_snippet=description_snippet,
+            reason=reason,
+        )
+        return web.json_response({"data": created}, status=201)
+    except ValueError as exc:
+        raise web.HTTPBadRequest(text=str(exc)) from exc
+
+
+async def update_tool_schema_handler(request: web.Request) -> web.Response:
+    body = await _json(request)
+    enabled = body.get("enabled")
+    if not isinstance(enabled, bool):
+        raise web.HTTPBadRequest(text="enabled boolean is required")
+    schema_id = request.match_info["schema_id"]
+    try:
+        value = await _store_call(request, "set_tool_schema_enabled", schema_id, enabled)
+        return web.json_response({"data": value})
+    except KeyError as exc:
+        raise web.HTTPNotFound(text=str(exc)) from exc
+
+
+async def delete_tool_schema_handler(request: web.Request) -> web.Response:
+    schema_id = request.match_info["schema_id"]
+    try:
+        await _store_call(request, "delete_tool_schema", schema_id)
+        return web.json_response({"deleted": True, "id": schema_id})
     except KeyError as exc:
         raise web.HTTPNotFound(text=str(exc)) from exc
 

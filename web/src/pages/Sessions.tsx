@@ -308,7 +308,13 @@ function SessionDetail({ id, refresh, onClose }: { id: string; refresh: number; 
           </div>
           <div className="summary-box-body">
             <span>敏感数据类型: <b>{session.dlp_categories?.length ? session.dlp_categories.join(', ') : '无'}</b></span>
-            <span>外发合规判定: <b>{session.has_dlp_alert ? '命中外发策略告警 ⚠️' : '合规放行'}</b></span>
+            <span>外发合规判定: <b>{
+              session.has_dlp_alert
+                ? (session.latest_trace_decision === 'allow'
+                    ? `历史曾告警 ⚠️ (${session.dlp_alert_count || 1} 轮告警，最新轮已放行)`
+                    : `命中外发策略告警 🚨 (${session.dlp_alert_count || 1} 轮未放行)`)
+                : '合规放行'
+            }</b></span>
           </div>
         </div>
 
@@ -525,7 +531,23 @@ function TraceCard({ trace, index, allExpanded, refresh }: { trace: TraceDetail;
           <div><span>策略结论</span><strong className={`decision-badge ${classification.policy_decision}`}>{classification.policy_decision}</strong></div>
           {!!classification.data_findings?.length && (
             <div className="dlp-findings">
-              {classification.data_findings.map((finding, index) => <span key={`${finding.path}-${index}`}><code>{finding.category}</code>{finding.path} · {finding.detector}</span>)}
+              {classification.data_findings.map((finding, index) => (
+                <span key={`${finding.path}-${index}`} style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', flexWrap: 'wrap' }}>
+                  <code>{finding.category}</code>
+                  {finding.path}
+                  {finding.path_type === 'tool_description' && (
+                    <span style={{ fontSize: '11px', background: 'rgba(59, 130, 246, 0.15)', color: '#60a5fa', padding: '1px 5px', borderRadius: '4px' }}>
+                      工具说明 {finding.tool_name ? `(${finding.tool_name})` : ''}
+                    </span>
+                  )}
+                  {finding.disposition === 'approved_metadata' && (
+                    <span style={{ fontSize: '11px', background: 'rgba(34, 197, 94, 0.15)', color: '#4ade80', padding: '1px 5px', borderRadius: '4px' }}>
+                      已登记受控 Schema
+                    </span>
+                  )}
+                  · {finding.detector}
+                </span>
+              ))}
             </div>
           )}
         </div>
