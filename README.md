@@ -113,7 +113,7 @@ curl -H "Authorization: Bearer $AUTOMODE_ADMIN_TOKEN" http://127.0.0.1:8787/heal
 | 环境变量 | 必填 | 默认 | 说明 |
 |---|---|---|---|
 | `AUTOMODE_UPSTREAM_BASE_URL` | | — | 配置时启用模型代理；为空则为独立事件服务（也可用 `--upstream`） |
-| `AUTOMODE_ADMIN_TOKEN` | 非本机监听 ✅ | — | 管理 API 的 Bearer Token（`/api/*`） |
+| `AUTOMODE_ADMIN_TOKEN` | 非本机监听 ✅ | — | 管理及审计 API 的 Token（`/api/*`、`/traces`、`/traces/*`）；支持 Bearer 或 `x-automode-admin-token` 请求头 |
 | `AUTOMODE_UPSTREAM_API_KEY` | | 透传 Agent 头 | 上游统一 Bearer Key |
 | `AUTOMODE_TRUSTED_PROXY_CIDRS` | | — | 可信身份头直连来源网段；不读取 X-Forwarded-For |
 | `AUTOMODE_EVIDENCE_KEY_FILE` | | — | 0600 的本地 AES-256-GCM 密钥文件 |
@@ -145,7 +145,7 @@ Fast/Deep 也可在控制台“设置”页临时应用 URL、模型和 Key。Ke
 | `/api/rules` | 兼容的模型动作旁证规则 |
 | `/api/playground/classify` | 三协议完整出站请求 DLP 测试，不执行工具、不转发模型 |
 | `/api/events` | SSE 实时事件（Trace/阶段/分类/告警/规则） |
-| `/traces`、`/traces/{id}` | 兼容的 Trace 查询接口 |
+| `/traces`、`/traces/{id}` | 兼容的 Trace 查询接口，使用与 `/api/*` 相同的管理员认证 |
 
 响应附带 `x-automode-trace-id`，便于从 Agent 日志定位会话。`Server-Timing` 记录转发关键路径内部耗时。
 
@@ -158,7 +158,7 @@ Fast/Deep 也可在控制台“设置”页临时应用 URL、模型和 Key。Ke
 - reasoning/thinking/analysis 不进入分类记录、测试记录或告警。
 - 模型普通回答不持久化；为提取工具调用，仅在内存中限量捕获响应，默认 8 MiB。
 - 超过捕获上限时仍持续流式转发，并以 `response_capture_incomplete` 进入告警。
-- 非 loopback 监听必须设置 `AUTOMODE_ADMIN_TOKEN`，管理 API 未授权返回 401。
+- 非 loopback 监听必须设置 `AUTOMODE_ADMIN_TOKEN`；配置后，管理及审计 API（`/api/*`、`/traces`、`/traces/*`）未授权返回 401。仅 loopback 监听且未配置 Token 时保留免认证开发模式；`/health` 保持匿名可用。
 - 当前网关只观察和告警敏感数据外发，不阻断模型请求；真正防外发需要后续 Request Enforce。模型工具动作仍只是旁证，若要阻断 Shell、MCP、HTTP，还需要独立 Action Gateway。
 - 会话风险识别区分“用户目的风险”和“外发动作意图”；后者不代表网盘上传或 Git 推送已发生。低置信度风险 reviewer 可接收实时用户原文，但风险记录、API、SSE 和控制台不保存或显示该原文。
 - 当前网关只观察和告警敏感数据外发，不阻断模型请求；真正防外发需要后续 Request Enforce。模型工具动作仍只是旁证，若要阻断 Shell、MCP、HTTP，还需要独立 Action Gateway。

@@ -613,7 +613,11 @@ def create_app(
 
     @web.middleware
     async def admin_auth(request: web.Request, handler: Any) -> web.StreamResponse:
-        if request.path.startswith("/api/") and token:
+        if token and (
+            request.path.startswith("/api/")
+            or request.path == "/traces"
+            or request.path.startswith("/traces/")
+        ):
             supplied = request.headers.get("x-automode-admin-token")
             authorization = request.headers.get("authorization", "")
             if not supplied and authorization.lower().startswith("bearer "):
