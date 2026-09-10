@@ -13,9 +13,19 @@ const FEEDBACKS = [
   { value: 'unsure', label: '不确定' },
 ] as const
 
+function llmSummary(alert: Alert): string {
+  if (alert.llm_status === 'failed') return '分析失败，不能判断为无风险'
+  if (alert.llm_status === 'pending' || alert.llm_status === 'processing') return '等待分析完成'
+  if (alert.review_status === 'needs_review') return '无法判断，待复核'
+  if (alert.llm_status === 'skipped') return '未执行 LLM 复核'
+  if (alert.llm_status === 'not_needed') return '未触发 LLM 复核'
+  return alert.llm_status === 'completed' ? 'LLM 未告警' : '暂无 LLM 分析结果'
+}
+
 export function Alerts({ refresh, onOpenTrace }: { refresh: number; onOpenTrace?: (sessionId: string | null, traceId: string) => void }) {
   const [statusFilter, setStatusFilter] = useState<string>('')
   const [typeFilter, setTypeFilter] = useState<string>('')
+  const [channelFilter, setChannelFilter] = useState<string>('')
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [localRefresh, setLocalRefresh] = useState(0)
   const [rawEvidence, setRawEvidence] = useState<unknown>(null)
@@ -25,9 +35,19 @@ export function Alerts({ refresh, onOpenTrace }: { refresh: number; onOpenTrace?
   const [noteSaving, setNoteSaving] = useState(false)
   const [noteStatus, setNoteStatus] = useState('')
 
+  let queryUrl = `/api/alerts?limit=200&status=${statusFilter}&alert_type=${typeFilter}&v=${refresh + localRefresh}`
+  if (channelFilter === 'dual') queryUrl += '&channel_source=dual'
+  else if (channelFilter === 'rule') queryUrl += '&channel_source=rule'
+  else if (channelFilter === 'llm') queryUrl += '&channel_source=llm'
+  else if (channelFilter === 'rule_hit') queryUrl += '&hit_source=rule_hit'
+  else if (channelFilter === 'llm_hit') queryUrl += '&hit_source=llm_hit'
+  else if (channelFilter === 'divergence') queryUrl += '&divergence=1'
+  else if (channelFilter === 'needs_review') queryUrl += '&review_status=needs_review'
+  else if (channelFilter === 'failed') queryUrl += '&review_status=failed'
+
   const { data, error } = useLoad<{ data: Alert[] }>(
-    `/api/alerts?limit=200&status=${statusFilter}&alert_type=${typeFilter}&v=${refresh + localRefresh}`,
-    refresh + localRefresh
+    queryUrl,
+    refresh + localRefresh + (channelFilter ? 1000 : 0)
   )
   const rows = data?.data || []
   const selected = rows.find(row => row.id === selectedId) || rows[0] || null
@@ -110,8 +130,21 @@ export function Alerts({ refresh, onOpenTrace }: { refresh: number; onOpenTrace?
       <section className="panel list-panel">
         <PanelTitle
           title="告警中心"
-          subtitle="双维度审计：数据出站违规 vs 动作意图违规；Observe 模式不阻断 Agent"
+          subtitle="双通道判定闭环：本地确定性规则依据 vs LLM 深度审查结论"
         />
+
+        {/* 双通道及特征筛选 */}
+        <div className="alert-filter-segmented" style={{ marginBottom: '8px' }}>
+          <button className={channelFilter === '' ? 'active' : ''} onClick={() => setChannelFilter('')}>全部通道</button>
+          <button className={channelFilter === 'rule_hit' ? 'active' : ''} onClick={() => setChannelFilter('rule_hit')}>规则命中（含双命中）</button>
+          <button className={channelFilter === 'llm_hit' ? 'active' : ''} onClick={() => setChannelFilter('llm_hit')}>LLM 命中（含双命中）</button>
+          <button className={channelFilter === 'dual' ? 'active' : ''} onClick={() => setChannelFilter('dual')}>⚡ 双命中 [Dual]</button>
+          <button className={channelFilter === 'rule' ? 'active' : ''} onClick={() => setChannelFilter('rule')}>🛡️ 仅规则 [Rule]</button>
+          <button className={channelFilter === 'llm' ? 'active' : ''} onClick={() => setChannelFilter('llm')}>🤖 仅 LLM [LLM]</button>
+          <button className={channelFilter === 'divergence' ? 'active' : ''} onClick={() => setChannelFilter('divergence')}>⚠️ 结论分歧</button>
+          <button className={channelFilter === 'needs_review' ? 'active' : ''} onClick={() => setChannelFilter('needs_review')}>🔍 待复核</button>
+          <button className={channelFilter === 'failed' ? 'active' : ''} onClick={() => setChannelFilter('failed')}>分析失败</button>
+        </div>
 
         {/* 告警类别筛选 */}
         <div className="alert-filter-segmented" style={{ marginBottom: '8px' }}>
@@ -146,6 +179,31 @@ export function Alerts({ refresh, onOpenTrace }: { refresh: number; onOpenTrace?
                       <span className={`alert-type-tag ${isDlp ? 'dlp' : 'intent'}`}>
                         {isDlp ? '🛡️ 数据出站' : '⚡ 动作意图'}
                       </span>
+                      {row.channel_source === 'dual' && (
+                        <span className="cat-chip" style={{ background: 'rgba(124, 58, 237, 0.2)', color: '#a78bfa', border: '1px solid #7c3aed' }}>
+                          [Dual]
+                        </span>
+                      )}
+                      {row.channel_source === 'rule' && (
+                        <span className="cat-chip" style={{ background: 'rgba(37, 99, 235, 0.2)', color: '#60a5fa', border: '1px solid #2563eb' }}>
+                          [Rule]
+                        </span>
+                      )}
+                      {row.channel_source === 'llm' && (
+                        <span className="cat-chip" style={{ background: 'rgba(5, 150, 105, 0.2)', color: '#34d399', border: '1px solid #059669' }}>
+                          [LLM]
+                        </span>
+                      )}
+                      {row.divergence && (
+                        <span className="status-pill warn" style={{ fontSize: '10px' }}>
+                          ⚠️ [结论分歧]
+                        </span>
+                      )}
+                      {row.review_status === 'needs_review' && (
+                        <span className="status-pill warn" style={{ fontSize: '10px' }}>
+                          待复核
+                        </span>
+                      )}
                       <b title={row.title}>{cleanTitle}</b>
                     </div>
                     <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
@@ -168,7 +226,7 @@ export function Alerts({ refresh, onOpenTrace }: { refresh: number; onOpenTrace?
         <section className="panel detail-panel">
           <div className="panel-heading">
             <div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px', flexWrap: 'wrap' }}>
                 <span className={`alert-type-tag ${selected.alert_type === 'dlp' || (selected.data_findings && selected.data_findings.length > 0) ? 'dlp' : 'intent'}`}>
                   {selected.alert_type === 'dlp' || (selected.data_findings && selected.data_findings.length > 0)
                     ? '🛡️ 出站数据违规告警'
@@ -176,21 +234,79 @@ export function Alerts({ refresh, onOpenTrace }: { refresh: number; onOpenTrace?
                     ? '⚡ 会话用户意图风险告警'
                     : '⚡ 行为意图违规告警'}
                 </span>
+                {selected.channel_source === 'dual' && (
+                  <span className="cat-chip" style={{ background: 'rgba(124, 58, 237, 0.2)', color: '#a78bfa', border: '1px solid #7c3aed' }}>
+                    [Dual] 双命中
+                  </span>
+                )}
+                {selected.channel_source === 'rule' && (
+                  <span className="cat-chip" style={{ background: 'rgba(37, 99, 235, 0.2)', color: '#60a5fa', border: '1px solid #2563eb' }}>
+                    [Rule] 仅规则
+                  </span>
+                )}
+                {selected.channel_source === 'llm' && (
+                  <span className="cat-chip" style={{ background: 'rgba(5, 150, 105, 0.2)', color: '#34d399', border: '1px solid #059669' }}>
+                    [LLM] 仅 LLM
+                  </span>
+                )}
+                {selected.divergence && (
+                  <span className="status-pill warn" style={{ fontSize: '11px' }}>
+                    ⚠️ [结论分歧]
+                  </span>
+                )}
                 <p className="eyebrow" style={{ margin: 0 }}>ALERT DETAIL</p>
               </div>
               <h2>{selected.title}</h2>
-              <p className="detail-subtitle">{selected.reason_code} · {formatTime(selected.created_at)}</p>
+              <p className="detail-subtitle">
+                {selected.reason_code} · {formatTime(selected.created_at)}
+                {selected.event_id && <span> · 关联事件: <code>{selected.event_id}</code></span>}
+              </p>
             </div>
             <StatusPill status={selected.status} />
           </div>
 
           <div className="alert-detail-body">
             <div className="detail-grid">
-              <div><span>风险级别</span><Risk level={selected.severity} /></div>
-              <div><span>判定阶段</span><b>{selected.final_stage}</b></div>
+              <div><span>综合风险级别</span><Risk level={selected.severity} /></div>
+              <div><span>命中通道</span><b>{selected.channel_source ? selected.channel_source.toUpperCase() : selected.final_stage}</b></div>
               <div><span>原因说明</span><b>{selected.reason}</b></div>
               {selected.acknowledged_at && <div><span>确认时间</span><b>{formatTime(selected.acknowledged_at)}</b></div>}
               {selected.destination && <div><span>模型目标</span><b>{selected.destination.name} · <StatusPill status={selected.destination.trust || 'external'} /></b></div>}
+            </div>
+
+            {/* 双通道并列展示：规则依据及等级 vs LLM 依据及等级 */}
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', margin: '14px 0' }}>
+              <div className="panel" style={{ padding: '12px', background: 'rgba(255,255,255,0.02)', border: '1px solid var(--border)' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+                  <b>🛡️ 规则依据及原始等级</b>
+                  {selected.rule_severity ? <Risk level={selected.rule_severity} /> : <span style={{ color: 'var(--muted)', fontSize: '12px' }}>未触发规则告警</span>}
+                </div>
+                <div style={{ fontSize: '12px', lineHeight: 1.5 }}>
+                  <div>原始阶段: <code>{selected.final_stage}</code></div>
+                  <div>规则原因码: <code>{selected.reason_code}</code></div>
+                  {selected.data_categories && selected.data_categories.length > 0 && (
+                    <div style={{ marginTop: '4px' }}>
+                      敏感类别: {selected.data_categories.map(c => <span key={c} className="cat-chip" style={{ marginLeft: '4px' }}>{c}</span>)}
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <div className="panel" style={{ padding: '12px', background: 'rgba(255,255,255,0.02)', border: '1px solid var(--border)' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+                  <b>🤖 LLM 依据及等级</b>
+                  {selected.llm_severity ? <Risk level={selected.llm_severity} /> : <span style={{ color: 'var(--muted)', fontSize: '12px' }}>{llmSummary(selected)}</span>}
+                </div>
+                <div style={{ fontSize: '12px', lineHeight: 1.5 }}>
+                  <div>LLM 状态: <StatusPill status={selected.llm_status || 'unknown'} /></div>
+                  <div>复核状态: <StatusPill status={selected.review_status || 'unknown'} /></div>
+                  {selected.divergence && (
+                    <div style={{ color: 'var(--warn)', marginTop: '4px', fontWeight: 600 }}>
+                      ⚠️ 存在结论分歧（两通道判定不一致）
+                    </div>
+                  )}
+                </div>
+              </div>
             </div>
 
             {/* 1. 出站数据敏感发现分析（DLP 维度） */}
@@ -198,10 +314,10 @@ export function Alerts({ refresh, onOpenTrace }: { refresh: number; onOpenTrace?
               <div className="evidence" style={{ borderLeft: '3px solid var(--danger)', paddingLeft: '12px' }}>
                 <b>🛡️ 出站数据违规发现 (DLP)</b>
                 {selected.data_findings?.map((finding, index) => {
-                  const isToolDesc = finding.path_type === 'tool_description' || finding.path.includes('.tools[')
+                  const isToolDesc = finding.path_type === 'tool_description' || Boolean(finding.path?.includes('.tools['))
                   const canPropose = isToolDesc && finding.category === 'source_code'
                   return (
-                    <div key={`${finding.path}-${index}`} style={{ margin: '6px 0', padding: '6px 8px', background: 'rgba(255,255,255,0.02)', borderRadius: '4px' }}>
+                    <div key={`${finding.path || index}-${index}`} style={{ margin: '6px 0', padding: '6px 8px', background: 'rgba(255,255,255,0.02)', borderRadius: '4px' }}>
                       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px', flexWrap: 'wrap' }}>
                         <span>
                           <code>{finding.category}</code> {finding.path} · {finding.detector}
@@ -260,7 +376,11 @@ export function Alerts({ refresh, onOpenTrace }: { refresh: number; onOpenTrace?
             {selected.matched_rules?.length > 0 && (
               <div className="evidence">
                 <b>命中规则/策略</b>
-                {selected.matched_rules.map(line => <code key={line}>{line}</code>)}
+                {selected.matched_rules.map((rule, idx) => {
+                  const r = rule as any
+                  const label = typeof r === 'string' ? r : (r?.name || r?.id || JSON.stringify(r))
+                  return <code key={`${label}-${idx}`}>{label}</code>
+                })}
               </div>
             )}
 

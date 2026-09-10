@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AutoMode standard event v1",
+  "type": "object",
+  "required": ["version", "event_id", "source_id", "call_id", "event_type", "protocol", "capture_stage", "content_integrity", "timestamp"],
+  "properties": {
+    "version": {"const": "1"},
+    "event_id": {"type": "string", "minLength": 1},
+    "source_id": {"type": "string", "minLength": 1},
+    "call_id": {"type": "string", "minLength": 1},
+    "attempt_id": {"type": ["string", "null"]},
+    "session_id": {"type": ["string", "null"]},
+    "event_type": {"enum": ["request", "response", "full_call"]},
+    "protocol": {"enum": ["openai_chat_completions", "openai_responses", "anthropic_messages"]},
+    "capture_stage": {"enum": ["inbound_request", "model_outbound", "unknown"]},
+    "content_integrity": {"enum": ["complete", "truncated", "redacted", "missing"]},
+    "timestamp": {"type": "string", "format": "date-time"},
+    "is_realtime": {"type": "boolean", "default": true},
+    "payload": {"type": ["object", "string", "null"]},
+    "model_destination": {"type": ["object", "null"]},
+    "identity": {
+      "type": ["object", "null"],
+      "properties": {"trusted": {"type": "boolean"}}
+    },
+    "metadata": {"type": "object"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"content_integrity": {"enum": ["complete", "truncated", "redacted"]}}},
+      "then": {"required": ["payload"], "properties": {"payload": {"type": ["object", "string"]}}}
+    }
+  ]
+}

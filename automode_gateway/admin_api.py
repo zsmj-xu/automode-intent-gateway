@@ -4,10 +4,13 @@ import asyncio
 import hmac
 import ipaddress
 import json
+import secrets
 from typing import Any
+import uuid
 
 from aiohttp import web
 
+from .event_ingress import DISK_BUFFER_KEY, EVENT_WORKER_KEY
 from .events import EVENT_BROKER_KEY
 from .dlp import evaluate_dlp
 from .dlp_rule_compiler import DLPPolicyCompileError, compile_dlp_policy
@@ -38,6 +41,14 @@ def register_admin_routes(app: web.Application, store: TraceStore) -> None:
     routes.add_post("/api/sessions/backfill", backfill_sessions)
     routes.add_get("/api/traces/{trace_id}/classification", classification)
     routes.add_get("/api/events", events)
+    routes.add_get("/api/events/{event_id}", get_event_handler)
+    routes.add_post("/api/events/{event_id}/retry", retry_event_handler)
+    routes.add_get("/api/sources", list_sources_handler)
+    routes.add_post("/api/sources", create_source_handler)
+    routes.add_put("/api/sources/{source_id}", update_source_handler)
+    routes.add_patch("/api/sources/{source_id}", update_source_handler)
+    routes.add_delete("/api/sources/{source_id}", delete_source_handler)
+    routes.add_get("/api/stats", stats_handler)
     routes.add_get("/api/alerts", alerts)
     routes.add_get("/api/alerts/{alert_id}", alert)
     routes.add_patch("/api/alerts/{alert_id}", update_alert)
@@ -88,7 +99,38 @@ def register_admin_routes(app: web.Application, store: TraceStore) -> None:
 
 
 async def dashboard(request: web.Request) -> web.Response:
-    return web.json_response(await _store_call(request, "dashboard"))
+    data = await _store_call(request, "dashboard")
+    store_stats = await _store_call(request, "get_queue_stats")
+    worker = request.app.get(EVENT_WORKER_KEY)
+    disk_buffer = request.app.get(DISK_BUFFER_KEY)
+    store = request.app[STORE_KEY]
+
+    rule_queue_depth = store_stats["db_rule_queue_depth"]
+    reviewer_queue_depth = store_stats["db_reviewer_queue_depth"]
+    disk_buffer_bytes = disk_buffer.used_bytes if disk_buffer is not None else 0
+    disk_buffer_limit_bytes = disk_buffer.max_buffer_bytes if disk_buffer is not None else (1024 * 1024 * 1024)
+
+    gateway = next((v for v in request.app.values() if hasattr(v, "reliability_mode")), None)
+    proxy_buffer_bytes = getattr(gateway, "proxy_buffer_bytes", 0) if gateway else 0
+    proxy_dropped_count = getattr(gateway, "proxy_dropped_count", 0) if gateway else 0
+
+    data["event_stats"] = {
+        "rule_queue_depth": rule_queue_depth,
+        "reviewer_queue_depth": reviewer_queue_depth,
+        "oldest_pending_task_age_seconds": store_stats["oldest_pending_task_age_seconds"],
+        "disk_buffer_bytes": disk_buffer_bytes,
+        "disk_buffer_limit_bytes": disk_buffer_limit_bytes,
+        "proxy_buffer_bytes": proxy_buffer_bytes,
+        "proxy_buffer_events": getattr(gateway, "proxy_buffer_events", 0) if gateway else 0,
+        "proxy_buffer_limit_bytes": getattr(gateway, "proxy_buffer_max_bytes", 0) if gateway else 0,
+        "proxy_dropped_count": proxy_dropped_count,
+        "proxy_failed_count": getattr(gateway, "proxy_failed_count", 0) if gateway else 0,
+        "proxy_dropped_by_reason": getattr(gateway, "proxy_dropped_by_reason", {}) if gateway else {},
+        "proxy_failed_by_reason": getattr(gateway, "proxy_failed_by_reason", {}) if gateway else {},
+        "reliability_mode": getattr(gateway, "reliability_mode", "standard_event_only"),
+        "failed_events_count": store_stats["failed_events_count"],
+    }
+    return web.json_response(data)
 
 
 async def sessions(request: web.Request) -> web.Response:
@@ -130,12 +172,207 @@ async def classification(request: web.Request) -> web.Response:
 
 
 async def events(request: web.Request) -> web.StreamResponse:
+    if "text/event-stream" in request.headers.get("Accept", "") or request.query.get("stream") == "true":
+        return await request.app[EVENT_BROKER_KEY].stream(request)
+    if "application/json" in request.headers.get("Accept", "") or any(
+        k in request.query for k in ("source_id", "is_historical", "is_realtime", "processing_status", "association_status", "limit", "offset", "status")
+    ):
+        return await list_events_handler(request)
     return await request.app[EVENT_BROKER_KEY].stream(request)
+
+
+async def list_events_handler(request: web.Request) -> web.Response:
+    limit = _limit(request)
+    offset = int(request.query.get("offset") or "0")
+    source_id = request.query.get("source_id")
+    processing_status = request.query.get("processing_status") or request.query.get("status")
+    association_status = request.query.get("association_status")
+    is_historical = request.query.get("is_historical")
+    is_realtime = request.query.get("is_realtime")
+    hist_val = None
+    if is_historical is not None:
+        hist_val = is_historical in ("1", "true", "True")
+    elif is_realtime is not None:
+        hist_val = not (is_realtime in ("1", "true", "True"))
+    result = await _store_call(
+        request,
+        "list_events",
+        limit=limit,
+        offset=offset,
+        source_id=source_id,
+        processing_status=processing_status,
+        association_status=association_status,
+        is_historical=hist_val,
+    )
+    # Keep the long-standing management API's ``id`` as the caller-visible
+    # event ID while exposing the storage UUID explicitly for operators.
+    for item in result.get("data", []):
+        item.setdefault("internal_id", item.get("id"))
+        item["id"] = item.get("event_id") or item.get("external_event_id") or item.get("id")
+    return web.json_response(result)
+
+
+async def get_event_handler(request: web.Request) -> web.Response:
+    event_id = request.match_info["event_id"]
+    detail = await _store_call(request, "get_event_detail", event_id)
+    if detail is None:
+        raise web.HTTPNotFound(text="event not found")
+    detail.setdefault("internal_id", detail.get("id"))
+    detail["id"] = detail.get("event_id") or detail.get("external_event_id") or detail.get("id")
+    return web.json_response(detail)
+
+
+async def retry_event_handler(request: web.Request) -> web.Response:
+    event_id = request.match_info["event_id"]
+    event = await _store_call(request, "get_event", event_id)
+    if event is None:
+        raise web.HTTPNotFound(text="event not found")
+
+    # A retry is an operator action for a terminal failed event.  Replaying a
+    # completed event would duplicate alerts and reviewer work.  The encrypted
+    # body must still exist; summaries cannot be used as replay input.
+    if event.get("processing_status") != "failed":
+        raise web.HTTPConflict(text="only failed events can be retried")
+    disk_path = event.get("disk_buffer_path")
+    disk_buffer = request.app.get(DISK_BUFFER_KEY)
+    worker = request.app.get(EVENT_WORKER_KEY)
+    if not disk_path or disk_buffer is None or worker is None or not disk_buffer.exists(event_id):
+        raise web.HTTPConflict(text="event body is unavailable for retry")
+    retry_stage = "rule" if event.get("rule_status") == "failed" else "reviewer" if event.get("llm_status") == "failed" else None
+    if retry_stage is None:
+        raise web.HTTPConflict(text="failed event has no retryable analysis stage")
+
+    await _store_call(
+        request,
+        "update_event_status",
+        event_id,
+        processing_status="pending",
+        error_message="",
+    )
+
+    if retry_stage == "rule":
+        await _store_call(request, "update_event_status", event_id, rule_status="pending")
+        await worker.enqueue_rule(event_id)
+    else:
+        await _store_call(request, "update_event_status", event_id, llm_status="pending")
+        await worker.enqueue_reviewer(event_id)
+
+    broker = request.app.get(EVENT_BROKER_KEY)
+    if broker is not None:
+        broker.publish("event.retried", {"id": event_id})
+
+    return web.json_response({"status": "retrying", "event_id": event_id})
+
+
+async def list_sources_handler(request: web.Request) -> web.Response:
+    sources = await _store_call(request, "list_sources")
+    return web.json_response({"data": sources})
+
+
+async def create_source_handler(request: web.Request) -> web.Response:
+    body = await _json(request)
+    name = body.get("name")
+    if not name:
+        raise web.HTTPBadRequest(text="name is required")
+    source_id = body.get("id") or str(uuid.uuid4())
+    token = body.get("token") or f"src_tok_{secrets.token_hex(16)}"
+    allow_trusted_identity = bool(body.get("allow_trusted_identity", False))
+    rate_limit_per_minute = body.get("rate_limit_per_minute")
+    enabled = bool(body.get("enabled", True))
+    try:
+        source = await _store_call(
+            request,
+            "create_source",
+            id=source_id,
+            name=name,
+            token=token,
+            allow_trusted_identity=allow_trusted_identity,
+            rate_limit_per_minute=rate_limit_per_minute,
+            enabled=enabled,
+        )
+        return web.json_response({"data": source}, status=201)
+    except Exception as exc:
+        raise web.HTTPBadRequest(text=str(exc)) from exc
+
+
+async def update_source_handler(request: web.Request) -> web.Response:
+    source_id = request.match_info["source_id"]
+    body = await _json(request)
+    source = await _store_call(request, "get_source", source_id)
+    if not source:
+        raise web.HTTPNotFound(text="source not found")
+    try:
+        updated = await _store_call(request, "update_source", source_id, **body)
+        return web.json_response({"data": updated})
+    except Exception as exc:
+        raise web.HTTPBadRequest(text=str(exc)) from exc
+
+
+async def delete_source_handler(request: web.Request) -> web.Response:
+    source_id = request.match_info["source_id"]
+    source = await _store_call(request, "get_source", source_id)
+    if not source:
+        raise web.HTTPNotFound(text="source not found")
+    await _store_call(request, "delete_source", source_id)
+    return web.json_response({"status": "deleted", "source_id": source_id})
+
+
+async def stats_handler(request: web.Request) -> web.Response:
+    store_stats = await _store_call(request, "get_queue_stats")
+    worker = request.app.get(EVENT_WORKER_KEY)
+    disk_buffer = request.app.get(DISK_BUFFER_KEY)
+    store = request.app[STORE_KEY]
+
+    rule_queue_depth = store_stats["db_rule_queue_depth"]
+    reviewer_queue_depth = store_stats["db_reviewer_queue_depth"]
+    disk_buffer_bytes = disk_buffer.used_bytes if disk_buffer is not None else 0
+    disk_buffer_limit_bytes = disk_buffer.max_buffer_bytes if disk_buffer is not None else (1024 * 1024 * 1024)
+
+    gateway = next((v for v in request.app.values() if hasattr(v, "reliability_mode")), None)
+    proxy_buffer_bytes = getattr(gateway, "proxy_buffer_bytes", 0) if gateway else 0
+    proxy_dropped_count = getattr(gateway, "proxy_dropped_count", 0) if gateway else 0
+
+    return web.json_response({
+        "rule_queue_depth": rule_queue_depth,
+        "reviewer_queue_depth": reviewer_queue_depth,
+        "oldest_pending_task_age_seconds": store_stats["oldest_pending_task_age_seconds"],
+        "disk_buffer_bytes": disk_buffer_bytes,
+        "disk_buffer_limit_bytes": disk_buffer_limit_bytes,
+        "proxy_buffer_bytes": proxy_buffer_bytes,
+        "proxy_buffer_events": getattr(gateway, "proxy_buffer_events", 0) if gateway else 0,
+        "proxy_buffer_limit_bytes": getattr(gateway, "proxy_buffer_max_bytes", 0) if gateway else 0,
+        "proxy_dropped_count": proxy_dropped_count,
+        "proxy_failed_count": getattr(gateway, "proxy_failed_count", 0) if gateway else 0,
+        "proxy_dropped_by_reason": getattr(gateway, "proxy_dropped_by_reason", {}) if gateway else {},
+        "proxy_failed_by_reason": getattr(gateway, "proxy_failed_by_reason", {}) if gateway else {},
+        "reliability_mode": getattr(gateway, "reliability_mode", "standard_event_only"),
+        "failed_events_count": store_stats["failed_events_count"],
+    })
 
 
 async def alerts(request: web.Request) -> web.Response:
     alert_type = request.query.get("alert_type") or request.query.get("category")
-    return web.json_response({"data": await _store_call(request, "alerts", _limit(request), request.query.get("status"), alert_type)})
+    status = request.query.get("status")
+    channel_source = request.query.get("channel_source")
+    hit_source = request.query.get("hit_source")
+    review_status = request.query.get("review_status")
+    div_param = request.query.get("divergence")
+    divergence = None
+    if div_param is not None:
+        divergence = div_param in ("1", "true", "True")
+    return web.json_response({
+        "data": await _store_call(
+            request,
+            "alerts",
+            _limit(request),
+            status=status,
+            alert_type=alert_type,
+            hit_source=hit_source,
+            review_status=review_status,
+            divergence=divergence,
+            channel_source=channel_source,
+        )
+    })
 
 
 async def get_prompts_handler(request: web.Request) -> web.Response:
@@ -401,7 +638,7 @@ async def playground_classify(request: web.Request) -> web.Response:
     protocol = str(body.get("protocol", "openai_chat_completions"))
     payload = body.get("payload") or body
     result = await asyncio.to_thread(
-        evaluate_dlp, payload, protocol=protocol, upstream=request.app[UPSTREAM_KEY],
+        evaluate_dlp, payload, protocol=protocol, upstream=str(body.get("upstream") or request.app.get(UPSTREAM_KEY) or ""),
         identity={"trusted": False, "roles": []}, targets=await _store_call(request, "list_destinations"),
         policies=await _store_call(request, "list_dlp_policies", True),
         prompts=await _store_call(request, "get_prompts"),
@@ -415,7 +652,7 @@ async def replay(request: web.Request) -> web.Response:
         raise web.HTTPNotFound(text="trace or raw request not found")
     body = {"protocol": trace["protocol"], "payload": trace["request_body"]}
     result = await asyncio.to_thread(
-        evaluate_dlp, body["payload"], protocol=body["protocol"], upstream=request.app[UPSTREAM_KEY],
+        evaluate_dlp, body["payload"], protocol=body["protocol"], upstream=str(request.app.get(UPSTREAM_KEY) or ""),
         identity={"trusted": False, "roles": []}, targets=await _store_call(request, "list_destinations"),
         policies=await _store_call(request, "list_dlp_policies", True),
         prompts=await _store_call(request, "get_prompts"),
@@ -495,7 +732,7 @@ async def test_dlp(request: web.Request) -> web.Response:
         policies = [*policies, {**policy, "id": "temporary", "version": 0, "enabled": True}]
     result = await asyncio.to_thread(
         evaluate_dlp, payload, protocol=str(body.get("protocol", "openai_chat_completions")),
-        upstream=request.app[UPSTREAM_KEY], identity={"trusted": False, "roles": []},
+        upstream=str(body.get("upstream") or request.app.get(UPSTREAM_KEY) or ""), identity={"trusted": False, "roles": []},
         targets=await _store_call(request, "list_destinations"), policies=policies,
     )
     return web.json_response(result)

@@ -1,18 +1,20 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Activity, AlertTriangle, Beaker, BookOpenCheck, Gauge, Menu, RefreshCw, Settings, ShieldCheck, X } from 'lucide-react'
+import { Activity, AlertTriangle, Beaker, BookOpenCheck, Gauge, Layers, Menu, RefreshCw, Settings, ShieldCheck, X } from 'lucide-react'
 import { getAdminToken, onUnauthorized, setAdminToken } from './api'
 import { useEventStream } from './lib/hooks'
 import { CommandPalette } from './components/CommandPalette'
 import { Dashboard } from './pages/Dashboard'
+import { Events } from './pages/Events'
 import { Sessions } from './pages/Sessions'
 import { Alerts } from './pages/Alerts'
 import { Governance } from './pages/Governance'
 import { Playground } from './pages/Playground'
 import { SettingsPage } from './pages/Settings'
 
-type Page = 'dashboard' | 'sessions' | 'alerts' | 'rules' | 'playground' | 'settings'
+type Page = 'dashboard' | 'events' | 'sessions' | 'alerts' | 'rules' | 'playground' | 'settings'
 const pages: Array<{ id: Page; label: string; icon: typeof Gauge }> = [
   { id: 'dashboard', label: '总览', icon: Gauge },
+  { id: 'events', label: '事件', icon: Layers },
   { id: 'sessions', label: '会话', icon: Activity },
   { id: 'alerts', label: '告警', icon: AlertTriangle },
   { id: 'rules', label: '策略', icon: BookOpenCheck },
@@ -60,7 +62,7 @@ export function App() {
 
   useEventStream(token, (name, live) => {
     setConnected(live)
-    if (name && ['trace.created', 'trace.completed', 'classification.completed', 'alert.created', 'alert.updated', 'rule.updated'].includes(name)) {
+    if (name && ['trace.created', 'trace.completed', 'classification.completed', 'alert.created', 'alert.updated', 'rule.updated', 'event.received', 'event.completed', 'event.failed', 'event.retried'].includes(name)) {
       setRefresh(value => value + 1)
     }
     if (name === 'alert.created') {
@@ -144,6 +146,7 @@ export function App() {
           : <div className="content">
             {page === 'dashboard' && <Dashboard refresh={refresh} onOpenTrace={openTrace} onOpenAlerts={() => navigate('alerts')} />}
             {page === 'sessions' && <Sessions refresh={refresh} />}
+            {page === 'events' && <Events refresh={refresh} />}
             {page === 'alerts' && <Alerts refresh={refresh} onOpenTrace={openTrace} />}
             {page === 'rules' && <Governance refresh={refresh} />}
             {page === 'playground' && <Playground />}

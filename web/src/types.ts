@@ -180,6 +180,8 @@ export interface AlertAction {
 }
 
 export type AlertStatus = 'open' | 'acknowledged' | 'false_positive' | 'resolved'
+export type ChannelSource = 'rule' | 'llm' | 'dual' | 'legacy' | string
+export type ReviewStatus = 'needs_review' | 'failed' | 'resolved' | string
 
 export interface Alert {
   id: string
@@ -206,6 +208,101 @@ export interface Alert {
   data_categories?: string[]
   destination_name?: string
   destination_trust?: 'trusted' | 'external'
+  rule_severity?: Risk | null
+  llm_severity?: Risk | null
+  llm_status?: string | null
+  review_status?: ReviewStatus
+  divergence?: boolean
+  hit_source?: string | null
+  channel_source?: ChannelSource
+  event_id?: string | null
+}
+
+export type CaptureStage = 'inbound_request' | 'model_outbound' | 'unknown'
+export type ContentIntegrity = 'complete' | 'truncated' | 'redacted' | 'missing'
+export type ProcessingStatus = 'pending' | 'processing' | 'completed' | 'failed'
+export type AssociationStatus = 'none' | 'associated' | 'request_missing'
+export type StageStatus = 'pending' | 'processing' | 'completed' | 'skipped' | 'failed'
+
+export interface EventAlertSummary {
+  id: string
+  severity: Risk
+  title: string
+  channel_source?: ChannelSource
+  status?: string
+}
+
+export interface EventItem {
+  id: string
+  event_id?: string
+  external_event_id?: string
+  source_id: string
+  call_id: string
+  attempt_id?: string | null
+  event_type: 'request' | 'response' | 'full_call' | string
+  protocol: string
+  capture_stage: CaptureStage
+  content_integrity: ContentIntegrity
+  is_realtime: boolean
+  is_historical?: boolean
+  timestamp: string
+  received_at: string
+  payload_hash?: string
+  disk_buffer_path?: string | null
+  processing_status: ProcessingStatus
+  association_status: AssociationStatus
+  rule_status: StageStatus
+  llm_status: StageStatus
+  rule_verdict?: Json | null
+  llm_verdict?: Json | null
+  response_evidence?: Json[]
+  retry_count: number
+  error_message?: string | null
+  completed_at?: string | null
+  metadata?: Json
+  alerts?: EventAlertSummary[]
+  tasks?: Array<{
+    id: string
+    stage: string
+    status: string
+    retry_count: number
+    created_at: string
+    updated_at: string
+    error_message?: string | null
+  }>
+  correlated_events?: Array<{
+    id: string
+    event_type: string
+    protocol: string
+    capture_stage: string
+    content_integrity: string
+    processing_status: string
+    association_status: string
+    received_at: string
+  }>
+}
+
+export interface SourceItem {
+  id: string
+  name: string
+  token: string
+  allow_trusted_identity: boolean
+  rate_limit_per_minute?: number | null
+  enabled: boolean
+  created_at: string
+  updated_at: string
+}
+
+export interface SystemStats {
+  rule_queue_depth: number
+  reviewer_queue_depth: number
+  oldest_pending_task_age_seconds: number | null
+  disk_buffer_bytes: number
+  disk_buffer_limit_bytes: number
+  proxy_buffer_bytes: number
+  proxy_dropped_count: number
+  reliability_mode: string
+  failed_events_count?: number
 }
 
 export interface DetectorItem {
@@ -264,6 +361,7 @@ export interface DashboardData {
     category_counts: Record<string, number>
     destination_counts: Record<string, number>
   }
+  event_stats?: SystemStats
 }
 
 export interface DLPPolicy {

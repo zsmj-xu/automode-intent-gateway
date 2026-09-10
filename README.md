@@ -5,7 +5,7 @@
 [![Node 20+](https://img.shields.io/badge/Node-20%2B-green)](https://nodejs.org/)
 [![Docker](https://img.shields.io/badge/Docker-Compose%20Ready-2496ed)](docker-compose.yml)
 
-一个位于 **Agent 与模型之间**的企业 AI 出站数据合规网关。它在不改写请求的前提下扫描完整出站 JSON，结合可信身份和模型目标识别敏感数据外发。MVP 处于 **Shadow / Observe 模式**：命中策略时记录和告警，但**不阻断**模型调用。
+一个提供**标准事件入口、独立分析引擎与管理端**的企业 AI 出站数据合规服务。外部接入服务可以提交模型请求与响应事件；原 Agent 到模型的透明代理保留为可选适配器。分析完整出站 JSON，结合可信身份和模型目标识别敏感数据外发。MVP 处于 **Shadow / Observe 模式**：命中策略时记录和告警，但**不阻断**模型调用。
 
 控制台提供 DLP 总览、出站请求时间线、告警、自然语言数据策略、目标注册表、测试实验室和加密证据调查。
 
@@ -53,7 +53,7 @@
                          └ Shadow 模式始终继续转发
 ```
 
-Fast/Deep 只处理 `review` 策略产生的强脱敏模糊事件；确定性敏感外发不依赖分类模型，也不能被模型降级。分类器不可用时事件保持 `needs_review` 并保守告警。
+检测线索或 `review` 策略触发 Fast/Deep 脱敏复核。规则与 LLM 分别记录结论：规则高危／严重不会因 LLM 失败或无告警而降级，中危规则被 LLM 确认后升为至少高危。LLM 失败、未完成和明确无告警分别展示；不完整正文不能被视为完整检查通过。
 
 ## 快速开始（本地）
 
@@ -66,16 +66,19 @@ npm --prefix web install
 npm --prefix web run build
 ```
 
-设置模型上游并启动：
+启动独立事件服务（无需配置模型上游）：
 
 ```bash
-export AUTOMODE_UPSTREAM_BASE_URL=http://127.0.0.1:4000
 export AUTOMODE_ADMIN_TOKEN=replace-with-a-random-token
 .venv/bin/auto-intent evidence-key .automode-evidence.key
 export AUTOMODE_EVIDENCE_KEY_FILE="$PWD/.automode-evidence.key"
 export AUTOMODE_TRUSTED_PROXY_CIDRS=127.0.0.0/8,::1/128
 .venv/bin/auto-intent serve --host 127.0.0.1 --port 8787
 ```
+
+在控制台“事件 → 来源与授权”创建接入来源，使用来源 Token 提交 `POST /v1/events`。标准入口需要加密密钥，持久化完成后返回 `202`；来源 Token 与管理 Token 分离。完整契约及示例见 [标准事件接入](docs/event-ingress.md)。
+
+要同时启用原代理，启动前设置 `AUTOMODE_UPSTREAM_BASE_URL=http://127.0.0.1:4000`。代理异步投递审计事件，落盘前存在进程崩溃丢失窗口；管理端分别展示磁盘缓冲与代理可靠性。未配置密钥时，代理仅提供有界的尽力分析，不具备事件恢复保证。
 
 历史 Trace 迁移为加密证据并用脱敏副本替换：
 
@@ -92,7 +95,7 @@ Agent 接入时，Anthropic Base URL 使用 `http://127.0.0.1:8787`；OpenAI 客
 仓库自带 `Dockerfile`（多阶段：Node 构建控制台 → Python 运行网关）与 `docker-compose.yml`。服务器上部署：
 
 ```bash
-cp .env.example .env        # 编辑 .env：必填 AUTOMODE_UPSTREAM_BASE_URL 与 AUTOMODE_ADMIN_TOKEN
+cp .env.example .env        # 编辑 .env：设置 AUTOMODE_ADMIN_TOKEN；模型代理的 upstream 可选
 docker compose up -d --build
 docker compose ps           # 等待 healthy
 curl -H "Authorization: Bearer $AUTOMODE_ADMIN_TOKEN" http://127.0.0.1:8787/health
@@ -109,7 +112,7 @@ curl -H "Authorization: Bearer $AUTOMODE_ADMIN_TOKEN" http://127.0.0.1:8787/heal
 
 | 环境变量 | 必填 | 默认 | 说明 |
 |---|---|---|---|
-| `AUTOMODE_UPSTREAM_BASE_URL` | ✅ | — | 上游模型服务地址（serve 也可用 `--upstream`） |
+| `AUTOMODE_UPSTREAM_BASE_URL` | | — | 配置时启用模型代理；为空则为独立事件服务（也可用 `--upstream`） |
 | `AUTOMODE_ADMIN_TOKEN` | 非本机监听 ✅ | — | 管理 API 的 Bearer Token（`/api/*`） |
 | `AUTOMODE_UPSTREAM_API_KEY` | | 透传 Agent 头 | 上游统一 Bearer Key |
 | `AUTOMODE_TRUSTED_PROXY_CIDRS` | | — | 可信身份头直连来源网段；不读取 X-Forwarded-For |
@@ -197,7 +200,7 @@ npm --prefix web run build
 npm --prefix web audit
 ```
 
-当前本地基线（2026-09-03）：后端 127 个测试、前端 6 个测试和生产构建全部通过；这不是生产或 live 验证。
+当前本地基线（2026-09-09）：后端 204 个测试、前端 9 个测试和生产构建通过。事件接入与代理修复的范围和验证见 [代码审查修复记录](docs/event-refactor-review-fixes.md)；这不是生产部署或全量容量验证。
 
 ## 文档
 

@@ -47,8 +47,6 @@ def _parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = _parser().parse_args()
     if args.command == "serve":
-        if not args.upstream:
-            raise SystemExit("--upstream or AUTOMODE_UPSTREAM_BASE_URL is required")
         run_gateway(args.host, args.port, args.upstream, args.db, not args.no_store_raw)
         return
 

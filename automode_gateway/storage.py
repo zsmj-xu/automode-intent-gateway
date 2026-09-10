@@ -71,7 +71,8 @@ CREATE TABLE IF NOT EXISTS traces (
     risk TEXT,
     decision TEXT,
     classification_json TEXT,
-    error TEXT
+    error TEXT,
+    correlation_status TEXT NOT NULL DEFAULT 'correlated'
 );
 CREATE INDEX IF NOT EXISTS idx_traces_created_at ON traces(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_traces_session_id ON traces(session_id, created_at);
@@ -97,6 +98,11 @@ CREATE TABLE IF NOT EXISTS classification_runs (
     evidence_id TEXT,
     identity_json TEXT NOT NULL DEFAULT '{}',
     semantic_status TEXT NOT NULL DEFAULT 'not_needed',
+    rule_severity TEXT,
+    llm_severity TEXT,
+    llm_status TEXT,
+    divergence INTEGER NOT NULL DEFAULT 0,
+    hit_source TEXT,
     FOREIGN KEY(trace_id) REFERENCES traces(id)
 );
 CREATE TABLE IF NOT EXISTS classification_stages (
@@ -119,16 +125,22 @@ CREATE TABLE IF NOT EXISTS rule_versions (
     UNIQUE(rule_id, version), FOREIGN KEY(rule_id) REFERENCES rules(id)
 );
 CREATE TABLE IF NOT EXISTS alerts (
-    id TEXT PRIMARY KEY, trace_id TEXT NOT NULL, classification_run_id TEXT NOT NULL,
+    id TEXT PRIMARY KEY, trace_id TEXT, classification_run_id TEXT,
     session_record_id TEXT, created_at TEXT NOT NULL, severity TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'open', reason_code TEXT NOT NULL, title TEXT NOT NULL,
     reason TEXT NOT NULL, evidence_json TEXT NOT NULL, actions_json TEXT NOT NULL,
     matched_rules_json TEXT NOT NULL, final_stage TEXT NOT NULL,
     evidence_id TEXT, data_findings_json TEXT NOT NULL DEFAULT '[]', destination_json TEXT NOT NULL DEFAULT '{}',
     acknowledged_at TEXT, operator_note TEXT, feedback TEXT,
+    rule_severity TEXT, llm_severity TEXT, llm_status TEXT,
+    review_status TEXT NOT NULL DEFAULT 'resolved',
+    divergence INTEGER NOT NULL DEFAULT 0,
+    hit_source TEXT,
+    channel_source TEXT NOT NULL DEFAULT 'legacy', event_id TEXT,
     FOREIGN KEY(trace_id) REFERENCES traces(id)
 );
 CREATE INDEX IF NOT EXISTS idx_alerts_created ON alerts(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_alerts_event_id ON alerts(event_id);
 CREATE TABLE IF NOT EXISTS test_runs (
     id TEXT PRIMARY KEY, created_at TEXT NOT NULL, input_json TEXT NOT NULL,
     temporary_rule_json TEXT, result_json TEXT NOT NULL
@@ -168,6 +180,62 @@ CREATE TABLE IF NOT EXISTS evidence_access_log (
     id TEXT PRIMARY KEY, evidence_id TEXT NOT NULL, accessed_at TEXT NOT NULL,
     actor TEXT NOT NULL, purpose TEXT NOT NULL, source TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS sources (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    token TEXT NOT NULL UNIQUE,
+    allow_trusted_identity INTEGER NOT NULL DEFAULT 0,
+    rate_limit_per_minute INTEGER,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sources_token ON sources(token);
+CREATE TABLE IF NOT EXISTS events (
+    id TEXT PRIMARY KEY,
+    external_event_id TEXT,
+    source_id TEXT NOT NULL,
+    call_id TEXT NOT NULL,
+    attempt_id TEXT,
+    event_type TEXT NOT NULL,
+    protocol TEXT NOT NULL,
+    capture_stage TEXT NOT NULL,
+    content_integrity TEXT NOT NULL,
+    is_realtime INTEGER NOT NULL DEFAULT 1,
+    timestamp TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    payload_hash TEXT NOT NULL,
+    body_hash TEXT,
+    disk_buffer_path TEXT,
+    processing_status TEXT NOT NULL DEFAULT 'pending',
+    association_status TEXT NOT NULL DEFAULT 'none',
+    rule_status TEXT NOT NULL DEFAULT 'pending',
+    llm_status TEXT NOT NULL DEFAULT 'pending',
+    rule_verdict_json TEXT,
+    llm_verdict_json TEXT,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    error_message TEXT,
+    completed_at TEXT,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    response_evidence_json TEXT NOT NULL DEFAULT '[]',
+    FOREIGN KEY(source_id) REFERENCES sources(id)
+);
+CREATE INDEX IF NOT EXISTS idx_events_call_id ON events(call_id);
+CREATE INDEX IF NOT EXISTS idx_events_source_id ON events(source_id);
+CREATE INDEX IF NOT EXISTS idx_events_status ON events(processing_status, rule_status, llm_status);
+CREATE TABLE IF NOT EXISTS event_tasks (
+    id TEXT PRIMARY KEY,
+    event_id TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    error_message TEXT,
+    FOREIGN KEY(event_id) REFERENCES events(id)
+);
+CREATE INDEX IF NOT EXISTS idx_event_tasks_stage_status ON event_tasks(stage, status);
+CREATE INDEX IF NOT EXISTS idx_event_tasks_event_id ON event_tasks(event_id);
 """
 
 TRACE_COLUMNS = {
@@ -181,6 +249,7 @@ TRACE_COLUMNS = {
     "response_body_json": "TEXT",
     "response_content_type": "TEXT",
     "response_capture_complete": "INTEGER NOT NULL DEFAULT 1",
+    "correlation_status": "TEXT NOT NULL DEFAULT 'correlated'",
 }
 
 STAGE_COLUMNS = {
@@ -192,6 +261,14 @@ ALERT_COLUMNS = {
     "evidence_id": "TEXT",
     "data_findings_json": "TEXT NOT NULL DEFAULT '[]'",
     "destination_json": "TEXT NOT NULL DEFAULT '{}'",
+    "rule_severity": "TEXT",
+    "llm_severity": "TEXT",
+    "llm_status": "TEXT",
+    "review_status": "TEXT NOT NULL DEFAULT 'resolved'",
+    "divergence": "INTEGER NOT NULL DEFAULT 0",
+    "hit_source": "TEXT",
+    "channel_source": "TEXT NOT NULL DEFAULT 'legacy'",
+    "event_id": "TEXT",
 }
 
 RUN_COLUMNS = {
@@ -205,6 +282,11 @@ RUN_COLUMNS = {
     "evidence_id": "TEXT",
     "identity_json": "TEXT NOT NULL DEFAULT '{}'",
     "semantic_status": "TEXT NOT NULL DEFAULT 'not_needed'",
+    "rule_severity": "TEXT",
+    "llm_severity": "TEXT",
+    "llm_status": "TEXT",
+    "divergence": "INTEGER NOT NULL DEFAULT 0",
+    "hit_source": "TEXT",
 }
 
 SESSION_COLUMNS = {
@@ -258,25 +340,44 @@ class TraceStore:
                 run_columns = {row[1] for row in connection.execute("PRAGMA table_info(classification_runs)")} if "classification_runs" in tables else set()
                 session_columns = {row[1] for row in connection.execute("PRAGMA table_info(sessions)")} if "sessions" in tables else set()
                 alert_columns = {row[1] for row in connection.execute("PRAGMA table_info(alerts)")} if "alerts" in tables else set()
+                event_columns = {row[1] for row in connection.execute("PRAGMA table_info(events)")} if "events" in tables else set()
             needs_migration = (
                 (trace_columns and set(TRACE_COLUMNS) - trace_columns)
                 or (stage_columns and set(STAGE_COLUMNS) - stage_columns)
                 or (run_columns and set(RUN_COLUMNS) - run_columns)
                 or (session_columns and set(SESSION_COLUMNS) - session_columns)
                 or (alert_columns and set(ALERT_COLUMNS) - alert_columns)
+                or (event_columns and {"external_event_id", "body_hash", "response_evidence_json"} - event_columns)
             )
             if needs_migration:
                 backup = database.with_name(f"{database.name}.pre-automode-migration.bak")
                 shutil.copy2(database, backup)
         try:
             with self._connect() as connection:
+                connection.execute("PRAGMA journal_mode=WAL")
                 connection.executescript(SCHEMA)
+                event_columns = {row[1] for row in connection.execute("PRAGMA table_info(events)")}
+                if "external_event_id" not in event_columns:
+                    connection.execute("ALTER TABLE events ADD COLUMN external_event_id TEXT")
+                if "body_hash" not in event_columns:
+                    connection.execute("ALTER TABLE events ADD COLUMN body_hash TEXT")
+                if "response_evidence_json" not in event_columns:
+                    connection.execute("ALTER TABLE events ADD COLUMN response_evidence_json TEXT NOT NULL DEFAULT '[]'")
+                # Events created by the first implementation used the external ID as
+                # their primary key. Preserve that value as the compatibility alias.
+                connection.execute(
+                    "UPDATE events SET external_event_id=id WHERE external_event_id IS NULL OR external_event_id=''"
+                )
+                connection.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_source_external_id "
+                    "ON events(source_id, external_event_id)"
+                )
                 for table, columns in (("traces", TRACE_COLUMNS), ("classification_stages", STAGE_COLUMNS), ("classification_runs", RUN_COLUMNS), ("sessions", SESSION_COLUMNS), ("alerts", ALERT_COLUMNS)):
                     existing = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
                     for name, definition in columns.items():
                         if name not in existing:
                             connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
-                connection.execute("PRAGMA journal_mode=WAL")
+                connection.execute("UPDATE alerts SET channel_source = 'legacy' WHERE channel_source IS NULL OR channel_source = ''")
         except Exception:
             if backup is not None:
                 shutil.copy2(backup, database)
@@ -328,29 +429,58 @@ class TraceStore:
                     "UPDATE sessions SET authorization_json=? WHERE id=?",
                     (json.dumps(merged, ensure_ascii=False), session_record_id),
                 )
-            connection.execute(
-                """INSERT INTO traces (
-                    id, created_at, protocol, method, path, model, session_id, is_stream,
-                    latest_user_text, declared_tool_count, request_headers_json, request_body_json,
-                    session_record_id, pipeline_status, session_evidence_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)""",
-                (
-                    trace_id,
-                    created_at,
-                    protocol,
-                    method,
-                    path,
-                    payload.get("model"),
-                    session_id,
-                    int(bool(payload.get("stream"))),
-                    safe_latest,
-                    declared_tool_count,
-                    json.dumps(safe_headers, ensure_ascii=False),
-                    json.dumps(safe_payload, ensure_ascii=False) if self.store_raw else None,
-                    session_record_id,
-                    json.dumps(session_evidence or {"status": "missing", "selected": None, "candidates": []}, ensure_ascii=False),
-                ),
-            )
+            existing_trace = connection.execute("SELECT id, correlation_status FROM traces WHERE id=?", (trace_id,)).fetchone()
+            if existing_trace is not None and existing_trace["correlation_status"] == "request_missing":
+                connection.execute(
+                    """UPDATE traces SET
+                        protocol=?, method=?, path=?, model=?, session_id=?, is_stream=?,
+                        latest_user_text=?, declared_tool_count=?, request_headers_json=?, request_body_json=?,
+                        session_record_id=?, pipeline_status='pending', session_evidence_json=?,
+                        correlation_status='correlated'
+                    WHERE id=?""",
+                    (
+                        protocol,
+                        method,
+                        path,
+                        payload.get("model"),
+                        session_id,
+                        int(bool(payload.get("stream"))),
+                        safe_latest,
+                        declared_tool_count,
+                        json.dumps(safe_headers, ensure_ascii=False),
+                        json.dumps(safe_payload, ensure_ascii=False) if self.store_raw else None,
+                        session_record_id,
+                        json.dumps(session_evidence or {"status": "missing", "selected": None, "candidates": []}, ensure_ascii=False),
+                        trace_id,
+                    ),
+                )
+                tool_count = connection.execute("SELECT COUNT(*) FROM tool_actions WHERE trace_id=?", (trace_id,)).fetchone()[0]
+                if tool_count and session_record_id:
+                    connection.execute("UPDATE sessions SET tool_call_count=tool_call_count+? WHERE id=?", (tool_count, session_record_id))
+            else:
+                connection.execute(
+                    """INSERT INTO traces (
+                        id, created_at, protocol, method, path, model, session_id, is_stream,
+                        latest_user_text, declared_tool_count, request_headers_json, request_body_json,
+                        session_record_id, pipeline_status, session_evidence_json, correlation_status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 'correlated')""",
+                    (
+                        trace_id,
+                        created_at,
+                        protocol,
+                        method,
+                        path,
+                        payload.get("model"),
+                        session_id,
+                        int(bool(payload.get("stream"))),
+                        safe_latest,
+                        declared_tool_count,
+                        json.dumps(safe_headers, ensure_ascii=False),
+                        json.dumps(safe_payload, ensure_ascii=False) if self.store_raw else None,
+                        session_record_id,
+                        json.dumps(session_evidence or {"status": "missing", "selected": None, "candidates": []}, ensure_ascii=False),
+                    ),
+                )
         return trace_id
 
     def set_classification(self, trace_id: str, result: dict[str, Any]) -> None:
@@ -384,8 +514,9 @@ class TraceStore:
                     id, trace_id, review_transcript_json, final_decision, final_stage, risk,
                     action_alignment, reason_code, reason, started_at, completed_at, total_latency_ms,
                     review_object, request_safety, request_purpose, data_findings_json,
-                    destination_json, policy_decision, matched_policies_json, evidence_id, identity_json, semantic_status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    destination_json, policy_decision, matched_policies_json, evidence_id, identity_json, semantic_status,
+                    rule_severity, llm_severity, llm_status, divergence, hit_source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     run_id, trace_id, json.dumps(result.get("review_transcript", []), ensure_ascii=False),
                     result["final_decision"], result["final_stage"], result["risk"],
@@ -397,6 +528,8 @@ class TraceStore:
                     json.dumps(result.get("matched_policies", []), ensure_ascii=False), result.get("evidence_id"),
                     json.dumps(result.get("identity", {}), ensure_ascii=False),
                     result.get("semantic_status", "not_needed"),
+                    result.get("rule_severity"), result.get("llm_severity"), result.get("llm_status"),
+                    int(bool(result.get("divergence"))), result.get("hit_source"),
                 ),
             )
             for stage in result.get("stages", []):
@@ -449,24 +582,293 @@ class TraceStore:
                     ),
                 )
             if result["final_decision"] == "alert":
-                alert_id = str(uuid.uuid4())
+                existing_alert = connection.execute(
+                    "SELECT id, status, operator_note, acknowledged_at, feedback FROM alerts WHERE trace_id=?",
+                    (trace_id,)
+                ).fetchone()
+                if existing_alert is not None:
+                    alert_id = existing_alert["id"]
+                    connection.execute(
+                        """UPDATE alerts SET
+                            classification_run_id=?, severity=?, reason_code=?, title=?, reason=?,
+                            evidence_json=?, actions_json=?, matched_rules_json=?, final_stage=?,
+                            evidence_id=?, data_findings_json=?, destination_json=?,
+                            rule_severity=?, llm_severity=?, llm_status=?, review_status=?,
+                            divergence=?, hit_source=?
+                        WHERE id=?""",
+                        (
+                            run_id, result["risk"], result["reason_code"], _alert_title(result),
+                            _redact(result["reason"]),
+                            json.dumps(result.get("authorization_evidence", []), ensure_ascii=False),
+                            json.dumps(result.get("proposed_actions", []), ensure_ascii=False),
+                            json.dumps(result.get("matched_rules", []), ensure_ascii=False),
+                            result["final_stage"], result.get("evidence_id"),
+                            json.dumps(result.get("data_findings", []), ensure_ascii=False),
+                            json.dumps(result.get("destination", {}), ensure_ascii=False),
+                            result.get("rule_severity"), result.get("llm_severity"), result.get("llm_status"),
+                            result.get("review_status", "resolved"), int(bool(result.get("divergence"))),
+                            result.get("hit_source"),
+                            alert_id,
+                        ),
+                    )
+                else:
+                    alert_id = str(uuid.uuid4())
+                    connection.execute(
+                        """INSERT INTO alerts (
+                            id, trace_id, classification_run_id, session_record_id, created_at, severity,
+                            reason_code, title, reason, evidence_json, actions_json, matched_rules_json, final_stage,
+                            evidence_id, data_findings_json, destination_json,
+                            rule_severity, llm_severity, llm_status, review_status, divergence, hit_source
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            alert_id, trace_id, run_id, session_id, completed_at, result["risk"],
+                            result["reason_code"], _alert_title(result), _redact(result["reason"]),
+                            json.dumps(result.get("authorization_evidence", []), ensure_ascii=False),
+                            json.dumps(result.get("proposed_actions", []), ensure_ascii=False),
+                            json.dumps(result.get("matched_rules", []), ensure_ascii=False), result["final_stage"], result.get("evidence_id"),
+                            json.dumps(result.get("data_findings", []), ensure_ascii=False),
+                            json.dumps(result.get("destination", {}), ensure_ascii=False),
+                            result.get("rule_severity"), result.get("llm_severity"), result.get("llm_status"),
+                            result.get("review_status", "resolved"), int(bool(result.get("divergence"))),
+                            result.get("hit_source"),
+                        ),
+                    )
+        return run_id, alert_id
+
+    def project_event_analysis(self, event_id: str, result: dict[str, Any]) -> dict[str, Any]:
+        """Project a proxy adapter event analysis onto its existing Trace.
+
+        ``result`` is the same pipeline record produced by
+        ``AnalysisEngine.pipeline_record`` (including ``final_*``, channel
+        severities, ``stages``, findings, destination and evidence ID). The
+        projection uses a deterministic run ID per event, so a rule-stage
+        write followed by an LLM-stage write updates one run and one set of
+        stages. It only links alerts already carrying ``event_id`` and never
+        touches session-risk alerts. Session decision counts change only by
+        the difference from the previously projected trace verdict.
+        """
+        internal_id = self.resolve_event_id(event_id)
+        if internal_id is None:
+            raise KeyError(f"event not found: {event_id}")
+        if not isinstance(result, dict):
+            raise TypeError("event analysis result must be an object")
+
+        with self._connect() as connection:
+            event = connection.execute("SELECT * FROM events WHERE id=?", (internal_id,)).fetchone()
+            if event is None:
+                raise KeyError(f"event not found: {event_id}")
+            if event["source_id"] != "proxy-adapter":
+                raise ValueError("event analysis projection requires source_id='proxy-adapter'")
+
+            raw_metadata = json.loads(event["metadata_json"] or "{}")
+            source_metadata = raw_metadata.get("source_metadata") if isinstance(raw_metadata, dict) else {}
+            if not isinstance(source_metadata, dict):
+                source_metadata = {}
+            trace_id = source_metadata.get("trace_id") or raw_metadata.get("trace_id")
+            if not isinstance(trace_id, str) or not trace_id:
+                raise ValueError("proxy event metadata must include trace_id")
+            trace = connection.execute("SELECT * FROM traces WHERE id=?", (trace_id,)).fetchone()
+            if trace is None:
+                raise KeyError(f"trace not found: {trace_id}")
+
+            run_id = f"event-analysis:{internal_id}"
+            completed_at = _now()
+            final_decision = str(result.get("final_decision") or result.get("decision") or "review")
+            final_stage = str(result.get("final_stage") or result.get("classifier_stage") or "rules")
+            risk = str(result.get("risk") or "low")
+            reason_code = str(result.get("reason_code") or "EVENT_ANALYSIS")
+            reason = _redact(str(result.get("reason") or "Event analysis projected to trace"))
+            stages = result.get("stages") if isinstance(result.get("stages"), list) else []
+            review_transcript = result.get("review_transcript") if isinstance(result.get("review_transcript"), list) else []
+            values = (
+                run_id, trace_id, json.dumps(_sanitize_projection(review_transcript), ensure_ascii=False),
+                final_decision, final_stage, risk,
+                str(result.get("action_alignment") or "unknown"), reason_code, reason,
+                completed_at, completed_at, float(result.get("total_latency_ms") or 0),
+                str(result.get("review_object") or "outbound_request"),
+                str(result.get("request_safety") or "not_reviewed"),
+                str(result.get("request_purpose") or "unknown"),
+                json.dumps(_sanitize_projection(result.get("data_findings") or []), ensure_ascii=False),
+                json.dumps(_sanitize_projection(result.get("destination") or {}), ensure_ascii=False),
+                str(result.get("policy_decision") or final_decision),
+                json.dumps(_sanitize_projection(result.get("matched_policies") or result.get("matched_rules") or []), ensure_ascii=False),
+                result.get("evidence_id"), json.dumps(_sanitize_projection(result.get("identity") or {}), ensure_ascii=False),
+                str(result.get("semantic_status") or result.get("review_status") or "not_needed"),
+                result.get("rule_severity"), result.get("llm_severity"), str(result.get("llm_status") or "not_needed"),
+                int(bool(result.get("divergence"))), result.get("hit_source"),
+            )
+            run_exists = connection.execute("SELECT id FROM classification_runs WHERE id=?", (run_id,)).fetchone()
+            if run_exists is None:
                 connection.execute(
-                    """INSERT INTO alerts (
-                        id, trace_id, classification_run_id, session_record_id, created_at, severity,
-                        reason_code, title, reason, evidence_json, actions_json, matched_rules_json, final_stage,
-                        evidence_id, data_findings_json, destination_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    """INSERT INTO classification_runs (
+                        id, trace_id, review_transcript_json, final_decision, final_stage, risk,
+                        action_alignment, reason_code, reason, started_at, completed_at, total_latency_ms,
+                        review_object, request_safety, request_purpose, data_findings_json,
+                        destination_json, policy_decision, matched_policies_json, evidence_id, identity_json, semantic_status,
+                        rule_severity, llm_severity, llm_status, divergence, hit_source
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    values,
+                )
+            else:
+                connection.execute(
+                    """UPDATE classification_runs SET
+                        trace_id=?, review_transcript_json=?, final_decision=?, final_stage=?, risk=?,
+                        action_alignment=?, reason_code=?, reason=?, completed_at=?, total_latency_ms=?,
+                        review_object=?, request_safety=?, request_purpose=?, data_findings_json=?,
+                        destination_json=?, policy_decision=?, matched_policies_json=?, evidence_id=?, identity_json=?, semantic_status=?,
+                        rule_severity=?, llm_severity=?, llm_status=?, divergence=?, hit_source=?
+                       WHERE id=?""",
+                    values[1:9] + values[10:] + (run_id,),
+                )
+
+            for index, stage in enumerate(stages):
+                if not isinstance(stage, dict):
+                    continue
+                stage_id = f"{run_id}:stage:{index}"
+                stage_values = (
+                    stage_id, run_id, str(stage.get("stage") or "rules"), str(stage.get("status") or "completed"),
+                    stage.get("model"), stage.get("input_hash"), str(stage.get("verdict") or "unknown"),
+                    str(stage.get("risk") or "low"), str(stage.get("reason_code") or reason_code),
+                    _redact(str(stage.get("reason") or reason)),
+                    json.dumps(_sanitize_projection(stage.get("matched_rule_ids") or []), ensure_ascii=False),
+                    json.dumps(_sanitize_projection(stage.get("matched_rule_versions") or []), ensure_ascii=False),
+                    float(stage.get("latency_ms") or 0), json.dumps(_sanitize_projection(stage.get("evidence") or []), ensure_ascii=False),
+                    stage.get("input_tokens"), stage.get("output_tokens"), stage.get("error_code"),
+                )
+                if connection.execute("SELECT id FROM classification_stages WHERE id=?", (stage_id,)).fetchone() is None:
+                    connection.execute(
+                        """INSERT INTO classification_stages (
+                            id, run_id, stage, status, model, input_hash, verdict, risk, reason_code,
+                            reason, matched_rule_ids_json, matched_rule_versions_json, latency_ms,
+                            evidence_json, input_tokens, output_tokens, error_code
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        stage_values,
+                    )
+                else:
+                    connection.execute(
+                        """UPDATE classification_stages SET stage=?, status=?, model=?, input_hash=?, verdict=?, risk=?,
+                           reason_code=?, reason=?, matched_rule_ids_json=?, matched_rule_versions_json=?, latency_ms=?,
+                           evidence_json=?, input_tokens=?, output_tokens=?, error_code=? WHERE id=?""",
+                        stage_values[2:] + (stage_id,),
+                    )
+
+            trace_summary = _sanitize_projection({
+                **result,
+                "trace_id": trace_id,
+                "event_id": internal_id,
+                "run_id": run_id,
+            })
+            connection.execute(
+                """UPDATE traces SET pipeline_status=?, final_decision=?, final_stage=?,
+                    final_reason_code=?, final_reason=?, risk=?, decision=?, classification_json=? WHERE id=?""",
+                ("processing" if result.get("llm_status") in {"pending", "processing"} else "completed",
+                 final_decision, final_stage, reason_code, reason, risk, final_decision,
+                 json.dumps(trace_summary, ensure_ascii=False), trace_id),
+            )
+            if trace["session_record_id"]:
+                previous = trace["final_decision"]
+                connection.execute(
+                    "UPDATE sessions SET allow_count=allow_count+?, alert_count=alert_count+?, max_risk=? WHERE id=?",
                     (
-                        alert_id, trace_id, run_id, session_id, completed_at, result["risk"],
-                        result["reason_code"], _alert_title(result), _redact(result["reason"]),
-                        json.dumps(result.get("authorization_evidence", []), ensure_ascii=False),
-                        json.dumps(result.get("proposed_actions", []), ensure_ascii=False),
-                        json.dumps(result.get("matched_rules", []), ensure_ascii=False), result["final_stage"], result.get("evidence_id"),
-                        json.dumps(result.get("data_findings", []), ensure_ascii=False),
-                        json.dumps(result.get("destination", {}), ensure_ascii=False),
+                        int(final_decision == "allow") - int(previous == "allow"),
+                        int(final_decision == "alert") - int(previous == "alert"),
+                        _max_risk_sql(connection, trace["session_record_id"], risk),
+                        trace["session_record_id"],
                     ),
                 )
-        return run_id, alert_id
+
+            alert_rows = connection.execute(
+                "SELECT id FROM alerts WHERE event_id=? ORDER BY created_at ASC", (internal_id,)
+            ).fetchall()
+            for alert in alert_rows:
+                # Link only event alerts. Existing status, acknowledgement,
+                # operator note and feedback are deliberately untouched.
+                connection.execute(
+                    "UPDATE alerts SET trace_id=?, session_record_id=?, classification_run_id=? WHERE id=?",
+                    (trace_id, trace["session_record_id"], run_id, alert["id"]),
+                )
+
+        return {
+            "event_id": internal_id,
+            "trace_id": trace_id,
+            "run_id": run_id,
+            "session_record_id": trace["session_record_id"],
+            "alert_ids": [str(row["id"]) for row in alert_rows],
+        }
+
+    def create_immediate_rule_alert(self, trace_id: str, rule_result: dict[str, Any]) -> str:
+        created_at = _now()
+        with self._connect() as connection:
+            trace = connection.execute(
+                "SELECT session_record_id FROM traces WHERE id=?", (trace_id,)
+            ).fetchone()
+            session_id = trace["session_record_id"] if trace else None
+            existing = connection.execute(
+                "SELECT id FROM alerts WHERE trace_id=?", (trace_id,)
+            ).fetchone()
+            if existing is not None:
+                return str(existing["id"])
+            alert_id = str(uuid.uuid4())
+            run_id = rule_result.get("run_id") or str(uuid.uuid4())
+            rule_sev = rule_result.get("rule_severity") or "high"
+            connection.execute(
+                """INSERT INTO alerts (
+                    id, trace_id, classification_run_id, session_record_id, created_at, severity,
+                    reason_code, title, reason, evidence_json, actions_json, matched_rules_json, final_stage,
+                    evidence_id, data_findings_json, destination_json,
+                    rule_severity, llm_severity, llm_status, review_status, divergence, hit_source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    alert_id, trace_id, run_id, session_id, created_at, rule_sev,
+                    rule_result.get("reason_code", "RULE_MATCH"), _alert_title(rule_result),
+                    _redact(rule_result.get("reason", "Outbound rule matched")),
+                    json.dumps(rule_result.get("authorization_evidence", []), ensure_ascii=False),
+                    json.dumps(rule_result.get("proposed_actions", []), ensure_ascii=False),
+                    json.dumps(rule_result.get("matched_rules", []), ensure_ascii=False),
+                    "rules", rule_result.get("evidence_id"),
+                    json.dumps(rule_result.get("data_findings", []), ensure_ascii=False),
+                    json.dumps(rule_result.get("destination", {}), ensure_ascii=False),
+                    rule_sev, None, rule_result.get("llm_status", "pending"),
+                    rule_result.get("review_status", "pending"), 0, "rule_only",
+                ),
+            )
+            connection.execute(
+                """UPDATE traces SET pipeline_status='processing', final_decision='alert', final_stage='rules',
+                    final_reason_code=?, final_reason=?, risk=?, decision='alert' WHERE id=?""",
+                (
+                    rule_result.get("reason_code", "RULE_MATCH"),
+                    _redact(rule_result.get("reason", "Outbound rule matched")),
+                    rule_sev, trace_id,
+                ),
+            )
+            return alert_id
+
+    def record_orphan_response(
+        self,
+        trace_id: str,
+        protocol: str = "openai_chat_completions",
+        tool_calls: list[dict[str, Any]] | None = None,
+        status: int | None = None,
+        response_bytes: int = 0,
+        latency_ms: float | None = None,
+        error: str | None = None,
+        response_capture_complete: bool = True,
+    ) -> None:
+        created_at = _now()
+        with self._connect() as connection:
+            existing = connection.execute("SELECT id FROM traces WHERE id=?", (trace_id,)).fetchone()
+            if existing is None:
+                connection.execute(
+                    """INSERT INTO traces (
+                        id, created_at, protocol, method, path, model, session_id, is_stream,
+                        latest_user_text, declared_tool_count, request_headers_json, request_body_json,
+                        response_status, response_bytes, latency_ms, error, pipeline_status,
+                        correlation_status, response_capture_complete
+                    ) VALUES (?, ?, ?, 'UNKNOWN', '/unknown', NULL, NULL, 0, '', 0, '{}', NULL, ?, ?, ?, ?, 'completed', 'request_missing', ?)""",
+                    (trace_id, created_at, protocol, status, response_bytes, latency_ms, error, int(response_capture_complete)),
+                )
+        if tool_calls:
+            self.record_tool_actions(trace_id, tool_calls)
 
     def record_tool_actions(self, trace_id: str, calls: list[dict[str, Any]]) -> None:
         """Persist response tool calls as evidence without making them the review object."""
@@ -504,6 +906,49 @@ class TraceStore:
                     "UPDATE sessions SET tool_call_count=tool_call_count+? WHERE id=?",
                     (inserted, trace["session_record_id"]),
                 )
+
+    def tool_actions(self, trace_id: str) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM tool_actions WHERE trace_id=? ORDER BY created_at",
+                (trace_id,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def record_event_tool_actions(self, event_id: str, calls: list[dict[str, Any]]) -> None:
+        """Persist redacted response tool-call corroboration exactly once."""
+        internal_id = self.resolve_event_id(event_id) or event_id
+        safe_calls = _sanitize_event_metadata(calls or [])
+        if not isinstance(safe_calls, list):
+            safe_calls = []
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT response_evidence_json FROM events WHERE id=?", (internal_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"event not found: {event_id}")
+            try:
+                existing = json.loads(row["response_evidence_json"] or "[]")
+            except (TypeError, json.JSONDecodeError):
+                existing = []
+            if not isinstance(existing, list):
+                existing = []
+            known = {
+                _sha256(json.dumps(item, ensure_ascii=False, sort_keys=True))
+                for item in existing
+            }
+            for item in safe_calls:
+                digest = _sha256(json.dumps(item, ensure_ascii=False, sort_keys=True))
+                if digest not in known:
+                    existing.append(item)
+                    known.add(digest)
+            connection.execute(
+                "UPDATE events SET response_evidence_json=? WHERE id=?",
+                (json.dumps(existing, ensure_ascii=False), internal_id),
+            )
+
+    record_event_response_evidence = record_event_tool_actions
+    record_event_tool_calls = record_event_tool_actions
 
     # Session user-intent risk -----------------------------------------------
     def session_risk_summary(self, session_id: str) -> dict[str, Any] | None:
@@ -1293,12 +1738,58 @@ class TraceStore:
         result["stages"] = [_json_row(row, ("matched_rule_ids_json", "matched_rule_versions_json", "evidence_json")) for row in stages]
         return result
 
-    def alerts(self, limit: int = 100, status: str | None = None, alert_type: str | None = None) -> list[dict[str, Any]]:
-        with self._connect() as connection:
-            if status:
-                rows = connection.execute("SELECT * FROM alerts WHERE status=? ORDER BY created_at DESC LIMIT ?", (status, min(limit, 500))).fetchall()
+    def alerts(
+        self,
+        limit: int = 100,
+        status: str | None = None,
+        alert_type: str | None = None,
+        hit_source: str | None = None,
+        review_status: str | None = None,
+        divergence: bool | None = None,
+        channel_source: str | None = None,
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM alerts"
+        conditions = []
+        params: list[Any] = []
+        if status:
+            conditions.append("status=?")
+            params.append(status)
+        if channel_source:
+            if channel_source in ("rule", "rule_only"):
+                conditions.append("(channel_source='rule' OR hit_source='rule_only')")
+            elif channel_source in ("llm", "llm_only"):
+                conditions.append("(channel_source='llm' OR hit_source='llm_only')")
+            elif channel_source in ("dual", "both"):
+                conditions.append("(channel_source='dual' OR hit_source='dual')")
             else:
-                rows = connection.execute("SELECT * FROM alerts ORDER BY created_at DESC LIMIT ?", (min(limit, 500),)).fetchall()
+                conditions.append("channel_source=?")
+                params.append(channel_source)
+        if hit_source:
+            if hit_source == "rule_hit":
+                conditions.append("(hit_source IN ('rule_only', 'dual') OR channel_source IN ('rule', 'dual') OR rule_severity IS NOT NULL)")
+            elif hit_source == "llm_hit":
+                conditions.append("(hit_source IN ('llm_only', 'dual') OR channel_source IN ('llm', 'dual') OR llm_severity IS NOT NULL)")
+            elif hit_source == "rule_only":
+                conditions.append("(hit_source='rule_only' OR channel_source='rule')")
+            elif hit_source == "llm_only":
+                conditions.append("(hit_source='llm_only' OR channel_source='llm')")
+            elif hit_source in ("dual", "both"):
+                conditions.append("(hit_source='dual' OR channel_source='dual')")
+            else:
+                conditions.append("(hit_source=? OR channel_source=?)")
+                params.extend([hit_source, hit_source])
+        if review_status:
+            conditions.append("review_status=?")
+            params.append(review_status)
+        if divergence is not None:
+            conditions.append("divergence=?")
+            params.append(1 if divergence else 0)
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(min(limit, 500))
+        with self._connect() as connection:
+            rows = connection.execute(query, tuple(params)).fetchall()
         result = [_alert_row(row) for row in rows]
         if alert_type:
             result = [row for row in result if row.get("alert_type") == alert_type]
@@ -1694,6 +2185,724 @@ class TraceStore:
             row = connection.execute("SELECT * FROM traces WHERE id=?", (trace_id,)).fetchone()
         return _public_row(row, include_raw=True) if row else None
 
+    # Source management --------------------------------------------------------
+
+    def create_source(
+        self,
+        id: str,
+        name: str,
+        token: str,
+        *,
+        allow_trusted_identity: bool = False,
+        rate_limit_per_minute: int | None = None,
+        enabled: bool = True,
+    ) -> dict[str, Any]:
+        now = _now()
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT INTO sources (id, name, token, allow_trusted_identity, rate_limit_per_minute, enabled, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (id, name, token, int(allow_trusted_identity), rate_limit_per_minute, int(enabled), now, now),
+            )
+        return self.get_source(id)  # type: ignore[return-value]
+
+    def get_source(self, source_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM sources WHERE id=?", (source_id,)).fetchone()
+        if not row:
+            return None
+        res = dict(row)
+        res["allow_trusted_identity"] = bool(res["allow_trusted_identity"])
+        res["enabled"] = bool(res["enabled"])
+        return res
+
+    def get_source_by_token(self, token: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM sources WHERE token=?", (token,)).fetchone()
+        if not row:
+            return None
+        res = dict(row)
+        res["allow_trusted_identity"] = bool(res["allow_trusted_identity"])
+        res["enabled"] = bool(res["enabled"])
+        return res
+
+    def list_sources(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute("SELECT * FROM sources ORDER BY created_at ASC").fetchall()
+        result = []
+        for row in rows:
+            res = dict(row)
+            res["allow_trusted_identity"] = bool(res["allow_trusted_identity"])
+            res["enabled"] = bool(res["enabled"])
+            result.append(res)
+        return result
+
+    def update_source(self, source_id: str, **kwargs: Any) -> dict[str, Any] | None:
+        if not kwargs:
+            return self.get_source(source_id)
+        fields = []
+        values: list[Any] = []
+        for k, v in kwargs.items():
+            if k in {"name", "token", "rate_limit_per_minute"}:
+                fields.append(f"{k}=?")
+                values.append(v)
+            elif k in {"allow_trusted_identity", "enabled"}:
+                fields.append(f"{k}=?")
+                values.append(int(bool(v)))
+        fields.append("updated_at=?")
+        values.append(_now())
+        values.append(source_id)
+        with self._connect() as connection:
+            connection.execute(f"UPDATE sources SET {', '.join(fields)} WHERE id=?", values)
+        return self.get_source(source_id)
+
+    def delete_source(self, source_id: str) -> bool:
+        with self._connect() as connection:
+            connection.execute("DELETE FROM sources WHERE id=?", (source_id,))
+            return connection.total_changes > 0
+
+    # Event ingestion & pipeline management ------------------------------------
+
+    def resolve_event_id(self, event_id: str, source_id: str | None = None) -> str | None:
+        """Resolve an internal event UUID, accepting the legacy external ID alias.
+
+        A source is required when an external ID is shared by more than one
+        source. This keeps old management/test callers working without allowing
+        a cross-source lookup to select an arbitrary event.
+        """
+        with self._connect() as connection:
+            row = connection.execute("SELECT id FROM events WHERE id=?", (event_id,)).fetchone()
+            if row is not None:
+                return str(row["id"])
+            if source_id:
+                row = connection.execute(
+                    "SELECT id FROM events WHERE source_id=? AND external_event_id=?",
+                    (source_id, event_id),
+                ).fetchone()
+            else:
+                rows = connection.execute(
+                    "SELECT id FROM events WHERE external_event_id=? LIMIT 2", (event_id,)
+                ).fetchall()
+                row = rows[0] if len(rows) == 1 else None
+            return str(row["id"]) if row is not None else None
+
+    def reserve_event(
+        self,
+        *,
+        internal_id: str | None = None,
+        external_event_id: str,
+        source_id: str,
+        call_id: str,
+        attempt_id: str | None = None,
+        event_type: str,
+        protocol: str,
+        capture_stage: str,
+        content_integrity: str,
+        is_realtime: bool = True,
+        timestamp: str,
+        payload_hash: str,
+        body_hash: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Atomically reserve a source/external ID before writing its body.
+
+        The reservation deliberately has no event task. A task is created only
+        by :meth:`finalize_event_storage`, after the encrypted file is durable.
+        """
+        received_at = _now()
+        internal_id = internal_id or str(uuid.uuid4())
+        metadata_json = json.dumps(_sanitize_event_metadata(metadata or {}), ensure_ascii=False)
+        with self._connect() as connection:
+            try:
+                connection.execute(
+                    """INSERT INTO events (
+                        id, external_event_id, source_id, call_id, attempt_id, event_type, protocol,
+                        capture_stage, content_integrity, is_realtime, timestamp, received_at,
+                        payload_hash, body_hash, processing_status, association_status, rule_status,
+                        llm_status, retry_count, metadata_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'persisting', 'none', 'pending', 'pending', 0, ?)""",
+                    (
+                        internal_id, external_event_id, source_id, call_id, attempt_id, event_type,
+                        protocol, capture_stage, content_integrity, int(is_realtime), timestamp,
+                        received_at, payload_hash, body_hash, metadata_json,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                row = connection.execute(
+                    "SELECT * FROM events WHERE source_id=? AND external_event_id=?",
+                    (source_id, external_event_id),
+                ).fetchone()
+                if row is None:
+                    raise
+                existing = dict(row)
+                if existing["payload_hash"] != payload_hash:
+                    return {"status": "conflict", "event": existing}
+                return {
+                    "status": "duplicate" if existing.get("disk_buffer_path") else "pending",
+                    "event": existing,
+                }
+        return {"status": "reserved", "internal_id": internal_id}
+
+    def finalize_event_storage(self, internal_id: str, disk_buffer_path: str) -> dict[str, Any]:
+        """Publish a durable body into the task index exactly once."""
+        now = _now()
+        with self._connect() as connection:
+            connection.execute(
+                """UPDATE events SET disk_buffer_path=?, processing_status='pending'
+                   WHERE id=? AND processing_status='persisting'""",
+                (disk_buffer_path, internal_id),
+            )
+            row = connection.execute("SELECT * FROM events WHERE id=?", (internal_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"event not found: {internal_id}")
+            if not row["disk_buffer_path"]:
+                raise RuntimeError(f"event storage is not finalized: {internal_id}")
+            task = connection.execute(
+                "SELECT id FROM event_tasks WHERE event_id=? AND stage='rule' LIMIT 1", (internal_id,)
+            ).fetchone()
+            if task is None:
+                connection.execute(
+                    """INSERT INTO event_tasks (id, event_id, stage, status, retry_count, created_at, updated_at)
+                       VALUES (?, ?, 'rule', 'pending', 0, ?, ?)""",
+                    (str(uuid.uuid4()), internal_id, now, now),
+                )
+        return dict(row)
+
+    def remove_event_reservation(self, internal_id: str) -> bool:
+        """Remove a reservation that never reached durable storage."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT processing_status, disk_buffer_path FROM events WHERE id=?", (internal_id,)
+            ).fetchone()
+            if row is None or row["processing_status"] != "persisting" or row["disk_buffer_path"]:
+                return False
+            connection.execute("DELETE FROM event_tasks WHERE event_id=?", (internal_id,))
+            connection.execute("DELETE FROM events WHERE id=?", (internal_id,))
+            return connection.total_changes > 0
+
+    def list_persisting_events(self) -> list[dict[str, Any]]:
+        """Return reservations awaiting file finalization for startup recovery."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM events WHERE processing_status='persisting' ORDER BY received_at ASC"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def record_event(
+        self,
+        *,
+        event_id: str,
+        source_id: str,
+        call_id: str,
+        attempt_id: str | None = None,
+        event_type: str,
+        protocol: str,
+        capture_stage: str,
+        content_integrity: str,
+        is_realtime: bool = True,
+        timestamp: str,
+        payload_hash: str,
+        body_hash: str | None = None,
+        disk_buffer_path: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        internal_id: str | None = None,
+    ) -> dict[str, Any]:
+        # This compatibility wrapper keeps the old direct ingestion API while
+        # routing all new records through the reservation/finalization protocol.
+        result = self.reserve_event(
+            internal_id=internal_id,
+            external_event_id=event_id, source_id=source_id, call_id=call_id,
+            attempt_id=attempt_id, event_type=event_type, protocol=protocol,
+            capture_stage=capture_stage, content_integrity=content_integrity,
+            is_realtime=is_realtime, timestamp=timestamp, payload_hash=payload_hash,
+            body_hash=body_hash,
+            metadata=metadata,
+        )
+        if result["status"] == "conflict":
+            raise ValueError(f"event_id '{event_id}' already exists with different content")
+        if result["status"] == "reserved":
+            resolved = result["internal_id"]
+            if disk_buffer_path:
+                self.finalize_event_storage(resolved, disk_buffer_path)
+            return self.get_event(resolved)  # type: ignore[return-value]
+        return result["event"]
+
+    def get_event(self, event_id: str, source_id: str | None = None) -> dict[str, Any] | None:
+        internal_id = self.resolve_event_id(event_id, source_id=source_id)
+        if internal_id is None:
+            return None
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM events WHERE id=?", (internal_id,)).fetchone()
+        return dict(row) if row else None
+
+    def get_event_by_source_and_id(self, source_id: str, event_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM events WHERE source_id=? AND external_event_id=?",
+                (source_id, event_id),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def find_correlated_events(
+        self,
+        source_id: str,
+        call_id: str,
+        attempt_id: str | None = None,
+        event_type: str | None = None,
+        capture_stage: str | None = None,
+        is_realtime: bool | None = None,
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM events WHERE source_id=? AND call_id=?"
+        params: list[Any] = [source_id, call_id]
+        if attempt_id is not None:
+            query += " AND attempt_id=?"
+            params.append(attempt_id)
+        else:
+            query += " AND (attempt_id IS NULL OR attempt_id='')"
+        if event_type is not None:
+            query += " AND event_type=?"
+            params.append(event_type)
+        if capture_stage is not None:
+            query += " AND capture_stage=?"
+            params.append(capture_stage)
+        if is_realtime is not None:
+            query += " AND is_realtime=?"
+            params.append(int(is_realtime))
+        query += " ORDER BY received_at ASC"
+        with self._connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def update_event_status(
+        self,
+        event_id: str,
+        *,
+        processing_status: str | None = None,
+        association_status: str | None = None,
+        rule_status: str | None = None,
+        llm_status: str | None = None,
+        rule_verdict: dict[str, Any] | None = None,
+        llm_verdict: dict[str, Any] | None = None,
+        retry_count: int | None = None,
+        error_message: str | None = None,
+        completed_at: str | None = None,
+        disk_buffer_path: str | None = None,
+    ) -> None:
+        internal_id = self.resolve_event_id(event_id)
+        if internal_id is None:
+            return
+        updates = []
+        values: list[Any] = []
+        if processing_status is not None:
+            updates.append("processing_status=?")
+            values.append(processing_status)
+        if association_status is not None:
+            updates.append("association_status=?")
+            values.append(association_status)
+        if rule_status is not None:
+            updates.append("rule_status=?")
+            values.append(rule_status)
+        if llm_status is not None:
+            updates.append("llm_status=?")
+            values.append(llm_status)
+        if rule_verdict is not None:
+            updates.append("rule_verdict_json=?")
+            values.append(json.dumps(rule_verdict, ensure_ascii=False))
+        if llm_verdict is not None:
+            updates.append("llm_verdict_json=?")
+            values.append(json.dumps(llm_verdict, ensure_ascii=False))
+        if retry_count is not None:
+            updates.append("retry_count=?")
+            values.append(retry_count)
+        if error_message is not None:
+            updates.append("error_message=?")
+            values.append(error_message)
+        if completed_at is not None:
+            updates.append("completed_at=?")
+            values.append(completed_at)
+        if disk_buffer_path is not None:
+            updates.append("disk_buffer_path=?")
+            values.append(disk_buffer_path)
+        if not updates:
+            return
+        values.append(internal_id)
+        with self._connect() as connection:
+            connection.execute(f"UPDATE events SET {', '.join(updates)} WHERE id=?", values)
+
+    def list_events(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        source_id: str | None = None,
+        processing_status: str | None = None,
+        association_status: str | None = None,
+        is_historical: bool | None = None,
+        is_realtime: bool | None = None,
+        status: str | None = None,
+    ) -> dict[str, Any]:
+        clauses = []
+        params: list[Any] = []
+        if source_id:
+            clauses.append("source_id=?")
+            params.append(source_id)
+        status_val = processing_status or status
+        if status_val:
+            clauses.append("processing_status=?")
+            params.append(status_val)
+        if association_status:
+            clauses.append("association_status=?")
+            params.append(association_status)
+        if is_historical is not None:
+            clauses.append("is_realtime=?")
+            params.append(0 if is_historical else 1)
+        elif is_realtime is not None:
+            clauses.append("is_realtime=?")
+            params.append(1 if is_realtime else 0)
+
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        count_query = f"SELECT COUNT(*) FROM events{where}"
+        data_query = f"SELECT * FROM events{where} ORDER BY received_at DESC LIMIT ? OFFSET ?"
+
+        with self._connect() as connection:
+            total = connection.execute(count_query, params).fetchone()[0]
+            query_params = list(params)
+            query_params.extend([min(limit, 500), max(0, offset)])
+            rows = connection.execute(data_query, query_params).fetchall()
+
+            event_ids = [r["id"] for r in rows]
+            alerts_by_event: dict[str, list[dict[str, Any]]] = {}
+            if event_ids:
+                placeholders = ", ".join("?" for _ in event_ids)
+                alert_rows = connection.execute(
+                    f"SELECT id, event_id, severity, title, channel_source, status FROM alerts WHERE event_id IN ({placeholders})",
+                    event_ids,
+                ).fetchall()
+                for ar in alert_rows:
+                    eid = ar["event_id"]
+                    if eid not in alerts_by_event:
+                        alerts_by_event[eid] = []
+                    alerts_by_event[eid].append({
+                        "id": ar["id"],
+                        "severity": ar["severity"],
+                        "title": ar["title"],
+                        "channel_source": ar["channel_source"],
+                        "status": ar["status"],
+                    })
+
+        items = []
+        for r in rows:
+            rule_verdict = json.loads(r["rule_verdict_json"] or "null")
+            llm_verdict = json.loads(r["llm_verdict_json"] or "null")
+            metadata = json.loads(r["metadata_json"] or "{}")
+            response_evidence = json.loads(r["response_evidence_json"] or "[]")
+            items.append({
+                "id": r["id"],
+                "internal_id": r["id"],
+                "event_id": r["external_event_id"] or r["id"],
+                "external_event_id": r["external_event_id"] or r["id"],
+                "source_id": r["source_id"],
+                "call_id": r["call_id"],
+                "attempt_id": r["attempt_id"],
+                "event_type": r["event_type"],
+                "protocol": r["protocol"],
+                "capture_stage": r["capture_stage"],
+                "content_integrity": r["content_integrity"],
+                "is_realtime": bool(r["is_realtime"]),
+                "is_historical": not bool(r["is_realtime"]),
+                "timestamp": r["timestamp"],
+                "received_at": r["received_at"],
+                "payload_hash": r["payload_hash"],
+                "disk_buffer_path": r["disk_buffer_path"],
+                "processing_status": r["processing_status"],
+                "association_status": r["association_status"],
+                "rule_status": r["rule_status"],
+                "llm_status": r["llm_status"],
+                "retry_count": r["retry_count"],
+                "error_message": r["error_message"],
+                "completed_at": r["completed_at"],
+                "rule_verdict": rule_verdict,
+                "llm_verdict": llm_verdict,
+                "response_evidence": response_evidence,
+                "metadata": metadata,
+                "alerts": alerts_by_event.get(r["id"], []),
+            })
+        return {"data": items, "total": total}
+
+    def get_event_detail(self, event_id: str) -> dict[str, Any] | None:
+        internal_id = self.resolve_event_id(event_id)
+        if internal_id is None:
+            return None
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM events WHERE id=?", (internal_id,)).fetchone()
+            if not row:
+                return None
+            tasks = [dict(t) for t in connection.execute(
+                "SELECT * FROM event_tasks WHERE event_id=? ORDER BY created_at ASC", (event_id,)
+            ).fetchall()]
+            alert_rows = connection.execute(
+                "SELECT * FROM alerts WHERE event_id=? ORDER BY created_at DESC", (row["id"],)
+            ).fetchall()
+            alerts = [_alert_row(a) for a in alert_rows]
+            correlated = [dict(c) for c in connection.execute(
+                """SELECT id, event_type, protocol, capture_stage, content_integrity,
+                          processing_status, association_status, received_at
+                   FROM events WHERE source_id=? AND call_id=? AND id!=? ORDER BY received_at ASC""",
+                (row["source_id"], row["call_id"], row["id"]),
+            ).fetchall()]
+
+        rule_verdict = json.loads(row["rule_verdict_json"] or "null")
+        llm_verdict = json.loads(row["llm_verdict_json"] or "null")
+        metadata = json.loads(row["metadata_json"] or "{}")
+        response_evidence = json.loads(row["response_evidence_json"] or "[]")
+
+        return {
+            "id": row["id"],
+            "internal_id": row["id"],
+            "event_id": row["external_event_id"] or row["id"],
+            "external_event_id": row["external_event_id"] or row["id"],
+            "source_id": row["source_id"],
+            "call_id": row["call_id"],
+            "attempt_id": row["attempt_id"],
+            "event_type": row["event_type"],
+            "protocol": row["protocol"],
+            "capture_stage": row["capture_stage"],
+            "content_integrity": row["content_integrity"],
+            "is_realtime": bool(row["is_realtime"]),
+            "is_historical": not bool(row["is_realtime"]),
+            "timestamp": row["timestamp"],
+            "received_at": row["received_at"],
+            "payload_hash": row["payload_hash"],
+            "disk_buffer_path": row["disk_buffer_path"],
+            "processing_status": row["processing_status"],
+            "association_status": row["association_status"],
+            "rule_status": row["rule_status"],
+            "llm_status": row["llm_status"],
+            "retry_count": row["retry_count"],
+            "error_message": row["error_message"],
+            "completed_at": row["completed_at"],
+            "rule_verdict": rule_verdict,
+            "llm_verdict": llm_verdict,
+            "response_evidence": response_evidence,
+            "metadata": metadata,
+            "tasks": tasks,
+            "alerts": alerts,
+            "correlated_events": correlated,
+        }
+
+    def get_queue_stats(self) -> dict[str, Any]:
+        with self._connect() as connection:
+            oldest_row = connection.execute(
+                "SELECT received_at FROM events WHERE processing_status IN ('pending', 'processing') ORDER BY received_at ASC LIMIT 1"
+            ).fetchone()
+            rule_pending = connection.execute(
+                "SELECT COUNT(*) FROM events WHERE rule_status IN ('pending', 'processing')"
+            ).fetchone()[0]
+            reviewer_pending = connection.execute(
+                "SELECT COUNT(*) FROM events WHERE llm_status IN ('pending', 'processing')"
+            ).fetchone()[0]
+            failed_count = connection.execute(
+                "SELECT COUNT(*) FROM events WHERE processing_status='failed'"
+            ).fetchone()[0]
+
+        oldest_age = None
+        if oldest_row and oldest_row[0]:
+            try:
+                dt_str = oldest_row[0].replace("Z", "+00:00")
+                recv_dt = datetime.fromisoformat(dt_str)
+                now_dt = datetime.now(timezone.utc)
+                oldest_age = max(0.0, round((now_dt - recv_dt).total_seconds(), 2))
+            except Exception:
+                oldest_age = 0.0
+
+        return {
+            "db_rule_queue_depth": rule_pending,
+            "db_reviewer_queue_depth": reviewer_pending,
+            "oldest_pending_task_age_seconds": oldest_age,
+            "failed_events_count": failed_count,
+        }
+
+    def create_event_alert(
+        self,
+        *,
+        event_id: str,
+        severity: str,
+        rule_severity: str | None,
+        llm_severity: str | None = None,
+        llm_status: str = "pending",
+        divergence: bool = False,
+        channel_source: str = "rule",
+        reason_code: str,
+        title: str,
+        reason: str,
+        evidence: list[Any] | None = None,
+        evidence_id: str | None = None,
+        data_findings: list[Any] | None = None,
+        destination: dict[str, Any] | None = None,
+    ) -> str:
+        # One aggregate alert belongs to one internal event. A deterministic ID
+        # makes retries and crash recovery idempotent while preserving any
+        # operator acknowledgement fields on the existing row.
+        internal_id = self.resolve_event_id(event_id) or event_id
+        alert_id = "event-alert-" + hashlib.sha256(internal_id.encode("utf-8")).hexdigest()
+        now = _now()
+        with self._connect() as connection:
+            current_event = connection.execute(
+                "SELECT source_id, call_id, event_type, capture_stage, is_realtime, attempt_id, body_hash FROM events WHERE id=?",
+                (internal_id,),
+            ).fetchone()
+            existing = connection.execute(
+                "SELECT id FROM alerts WHERE event_id=? ORDER BY created_at ASC LIMIT 1",
+                (internal_id,),
+            ).fetchone()
+            if existing is not None:
+                return str(existing["id"])
+            # A full_call envelope and its separately submitted request can
+            # represent the same observation. Reuse the existing aggregate
+            # alert when their source, call and canonical event hash agree.
+            if current_event is not None and current_event["event_type"] in {"request", "full_call"}:
+                overlap = connection.execute(
+                    """SELECT a.id FROM alerts a JOIN events e ON e.id=a.event_id
+                       WHERE e.source_id=? AND e.call_id=? AND e.capture_stage=? AND e.is_realtime=?
+                         AND (e.attempt_id=? OR (e.attempt_id IS NULL AND ? IS NULL)) AND e.body_hash=?
+                         AND e.event_type IN ('request', 'full_call')
+                       ORDER BY a.created_at ASC LIMIT 1""",
+                    (
+                        current_event["source_id"], current_event["call_id"], current_event["capture_stage"],
+                        current_event["is_realtime"], current_event["attempt_id"], current_event["attempt_id"],
+                        current_event["body_hash"],
+                    ),
+                ).fetchone()
+                if overlap is not None:
+                    return str(overlap["id"])
+            try:
+                connection.execute(
+                """INSERT INTO alerts (
+                    id, trace_id, classification_run_id, session_record_id, created_at, severity,
+                    status, reason_code, title, reason, evidence_json, actions_json, matched_rules_json,
+                    final_stage, evidence_id, data_findings_json, destination_json,
+                    rule_severity, llm_severity, llm_status, divergence, channel_source, event_id
+                ) VALUES (?, ?, ?, NULL, ?, ?, 'open', ?, ?, ?, ?, '[]', '[]', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    alert_id,
+                    internal_id,
+                    f"event:{internal_id}",
+                    now,
+                    severity,
+                    reason_code,
+                    title,
+                    reason,
+                    json.dumps(_sanitize_event_metadata(evidence or []), ensure_ascii=False),
+                    channel_source,
+                    evidence_id,
+                    json.dumps(_sanitize_event_metadata(data_findings or []), ensure_ascii=False),
+                    json.dumps(_sanitize_event_metadata(destination or {}), ensure_ascii=False),
+                    rule_severity,
+                    llm_severity,
+                    llm_status,
+                    int(divergence),
+                    channel_source,
+                    internal_id,
+                ),
+                )
+            except sqlite3.IntegrityError:
+                # Another worker can win the same deterministic insert.
+                existing = connection.execute(
+                    "SELECT id FROM alerts WHERE event_id=? ORDER BY created_at ASC LIMIT 1",
+                    (internal_id,),
+                ).fetchone()
+                if existing is not None:
+                    return str(existing["id"])
+                raise
+            connection.execute(
+                "UPDATE alerts SET review_status=?, hit_source=? WHERE id=?",
+                (
+                    "pending" if llm_status in {"pending", "processing"} else "failed" if llm_status == "failed" else "resolved",
+                    "dual" if channel_source == "dual" else "llm_only" if channel_source == "llm" else "rule_only",
+                    alert_id,
+                ),
+            )
+        return alert_id
+
+    def update_event_alert_llm(
+        self,
+        event_id: str,
+        *,
+        llm_severity: str,
+        llm_status: str,
+        divergence: bool,
+        overall_severity: str | None = None,
+    ) -> None:
+        internal_id = self.resolve_event_id(event_id) or event_id
+        with self._connect() as connection:
+            existing = connection.execute("SELECT rule_severity, channel_source FROM alerts WHERE event_id=?", (internal_id,)).fetchone()
+            rule_sev = existing["rule_severity"] if existing else None
+            is_dual = bool(rule_sev in ("medium", "high", "critical") and llm_severity in ("medium", "high", "critical"))
+            channel = "dual" if is_dual else ("rule" if rule_sev in ("medium", "high", "critical") else "llm")
+            if overall_severity:
+                connection.execute(
+                    """UPDATE alerts SET llm_severity=?, llm_status=?, divergence=?, severity=?, channel_source=?
+                       WHERE event_id=?""",
+                    (llm_severity, llm_status, int(divergence), overall_severity, channel, internal_id),
+                )
+            else:
+                connection.execute(
+                    """UPDATE alerts SET llm_severity=?, llm_status=?, divergence=?, channel_source=?
+                       WHERE event_id=?""",
+                    (llm_severity, llm_status, int(divergence), channel, internal_id),
+                )
+
+    def update_event_alert(
+        self,
+        event_id: str,
+        *,
+        verdict: dict[str, Any],
+        llm_result: dict[str, Any] | None = None,
+    ) -> str | None:
+        """Idempotently commit a dual-channel event verdict and alert.
+
+        The event worker calls this after persisting each channel result. It
+        updates one stable alert row and creates it for an LLM-only hit.
+        """
+        internal_id = self.resolve_event_id(event_id) or event_id
+        llm_result = llm_result or {}
+        alert = bool(verdict.get("alert"))
+        if not alert:
+            return None
+        rule_severity = verdict.get("rule_severity")
+        llm_severity = verdict.get("llm_severity")
+        llm_status = verdict.get("llm_status") or llm_result.get("llm_status") or "pending"
+        hit_source = verdict.get("hit_source")
+        channel_source = "dual" if hit_source == "dual" else ("llm" if hit_source == "llm_only" else "rule")
+        event = self.get_event(internal_id)
+        rule_result = json.loads(event.get("rule_verdict_json") or "{}") if event else {}
+        alert_id = self.create_event_alert(
+            event_id=internal_id,
+            severity=verdict.get("severity") or rule_severity or llm_severity or "medium",
+            rule_severity=rule_severity,
+            llm_severity=llm_severity,
+            llm_status=llm_status,
+            divergence=bool(verdict.get("divergence")),
+            channel_source=channel_source,
+            reason_code=str(verdict.get("reason_code") or "EVENT_REVIEW"),
+            title=f"{str(verdict.get('severity') or 'medium').upper()}: Outbound Data Review Hit",
+            reason=str(verdict.get("reason") or "Outbound event review identified risk"),
+            evidence_id=rule_result.get("evidence_id") or llm_result.get("evidence_id"),
+            data_findings=rule_result.get("data_findings") or verdict.get("data_findings") or [],
+            destination=rule_result.get("destination") or verdict.get("destination") or {},
+        )
+        with self._connect() as connection:
+            connection.execute(
+                """UPDATE alerts SET severity=?, rule_severity=?, llm_severity=?, llm_status=?,
+                   review_status=?, divergence=?, hit_source=?, channel_source=? WHERE id=?""",
+                (
+                    verdict.get("severity") or rule_severity or llm_severity or "medium",
+                    rule_severity, llm_severity, llm_status,
+                    verdict.get("review_status") or "pending", int(bool(verdict.get("divergence"))),
+                    hit_source, channel_source, alert_id,
+                ),
+            )
+        return alert_id
+
 
 def _public_row(row: sqlite3.Row, include_raw: bool = False) -> dict[str, Any]:
     result = dict(row)
@@ -1701,6 +2910,8 @@ def _public_row(row: sqlite3.Row, include_raw: bool = False) -> dict[str, Any]:
         result[field.removesuffix("_json")] = json.loads(result.pop(field) or "null")
     if result["classification"] is None:
         result["classification"] = {"decision": "pending", "proposed_tool_calls": []}
+    elif isinstance(result["classification"], dict):
+        result["classification"].setdefault("proposed_tool_calls", [])
     raw = result.pop("request_body_json")
     response_raw = result.pop("response_body_json", None)
     if include_raw:
@@ -2018,9 +3229,43 @@ def _sanitize_payload(value: Any, key: str = "") -> Any:
     return value
 
 
+def _sanitize_event_metadata(value: Any) -> Any:
+    """Keep event metadata useful while ensuring credential-bearing values stay redacted."""
+    return _sanitize_payload(value)
+
+
+_PROJECTION_BODY_KEYS = {
+    "payload", "request_body", "response_body", "raw", "body", "messages",
+    "tool_result", "input", "output", "prompt", "completion",
+}
+
+
+def _sanitize_projection(value: Any, key: str = "") -> Any:
+    """Build a small, redacted analysis read-model without event正文."""
+    if isinstance(value, dict):
+        return {
+            str(item_key): _sanitize_projection(item, str(item_key))
+            for item_key, item in value.items()
+            if str(item_key).lower() not in _PROJECTION_BODY_KEYS
+        }
+    if isinstance(value, list):
+        return [_sanitize_projection(item, key) for item in value]
+    if isinstance(value, str):
+        text = _redact(value)
+        text = re.sub(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", "[REDACTED:EMAIL]", text)
+        text = re.sub(r"(?<!\d)1[3-9]\d{9}(?!\d)", "[REDACTED:PHONE]", text)
+        text = re.sub(r"(?<!\d)\d{3}-\d{2}-\d{4}(?!\d)", "[REDACTED:SSN]", text)
+        return text[:2000]
+    return value
+
+
 def _secret_key(key: str) -> bool:
     normalized = key.lower().replace("-", "_")
-    return normalized in {"authorization", "api_key", "x_api_key", "cookie", "proxy_authorization", "password", "secret", "token"}
+    return normalized in {
+        "authorization", "api_key", "x_api_key", "cookie", "set_cookie",
+        "proxy_authorization", "password", "secret", "token", "access_token",
+        "client_secret", "credential", "credentials", "private_key",
+    } or any(part in normalized for part in ("api_key", "access_token", "client_secret", "password", "credential"))
 
 
 def _redact(value: str) -> str:
@@ -2070,6 +3315,12 @@ def _alert_row(row: sqlite3.Row) -> dict[str, Any]:
     destination = value.get("destination") or {}
     value["destination_name"] = destination.get("name") or destination.get("model") or "未知模型"
     value["destination_trust"] = destination.get("trust", "external")
+    value["divergence"] = bool(value.get("divergence"))
+    value["review_status"] = value.get("review_status") or "resolved"
+    if not value.get("channel_source"):
+        value["channel_source"] = "legacy"
+    if not value.get("rule_severity"):
+        value["rule_severity"] = value.get("severity")
     return value
 
 

@@ -8,7 +8,7 @@
 
 - 安装：`.venv/bin/pip install -e '.[dev]'`、`npm --prefix web install`
 - 构建控制台：`npm --prefix web run build`
-- 启动：设置 `AUTOMODE_UPSTREAM_BASE_URL` 后运行 `.venv/bin/auto-intent serve --host 127.0.0.1 --port 8787`
+- 启动：运行 `.venv/bin/auto-intent serve --host 127.0.0.1 --port 8787`；标准事件入口需要 `AUTOMODE_EVIDENCE_KEY_FILE` 和已登记来源 Token，设置 `AUTOMODE_UPSTREAM_BASE_URL` 时另启用透明代理。
 - 后端测试：`.venv/bin/python -m unittest discover -s tests -p 'test_*.py'`
 - 前端测试：`npm --prefix web test`
 - 本地控制台：`http://127.0.0.1:8787/`
@@ -33,6 +33,7 @@
 ## 当前状态
 
 - Anthropic Messages、OpenAI Chat Completions、OpenAI Responses、JSON/SSE 和 Shadow DLP 均已实现。
+- 架构演进为标准事件接入 (`POST /v1/events`、AES-GCM 磁盘加密缓冲与两级并发任务调度) 与独立分析引擎 (`AnalysisEngine`)，双通道告警判定（确定性规则不降级、双命中升维、结论分歧标记与即时告警+异步幂等回写），原透明代理下沉为可选适配器（无 upstream 亦可独立启动事件分析服务）。
 - 出站数据策略采用独立受限结构化编译，支持预览、测试、启停和版本；确定性硬检测器矩阵支持独立启停与自定义正则检测器录入，服务端编译校验且控制台提供本地样例匹配预检；审查模型 System Prompts 支持可视化在线修改与重置。
 - 会话按优先级归组：显式 session id（header/metadata/`previous_response_id`）→ 会话内容指纹（`session_fingerprint.py`，校验前缀续接）→ trace 级 fallback；历史 capability/constraint 摘要仅作旁证，DLP 结论以完整出站请求、可信身份和目标模型为输入。
-- 当前验证基线为后端 127 个测试、前端 6 个测试和生产构建通过；Request Enforce、Action Gateway、SSO/RBAC、KMS、OCR 和多机部署仍未实现。
+- 当前本地验证基线为后端 204 个测试、前端 9 个测试和生产构建通过；覆盖本轮事件接入、告警与代理代码审查修复，详见 `docs/event-refactor-review-fixes.md`。这不代表生产容量或整个重构计划的全部场景已验收；Request Enforce、Action Gateway、SSO/RBAC、KMS、OCR 和多机部署仍未实现。

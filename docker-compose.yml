@@ -7,8 +7,8 @@ services:
     ports:
       - "${AUTOMODE_PORT:-8787}:8787"
     environment:
-      # 必填：上游模型服务地址（外部地址，或 host.docker.internal 指向宿主机）
-      AUTOMODE_UPSTREAM_BASE_URL: ${AUTOMODE_UPSTREAM_BASE_URL:?set AUTOMODE_UPSTREAM_BASE_URL in .env}
+      # 可选：不填时仅提供标准事件入口与管理端，填写后启用模型代理
+      AUTOMODE_UPSTREAM_BASE_URL: ${AUTOMODE_UPSTREAM_BASE_URL:-}
       # 必填：非 loopback 监听要求的管理端 Token（/api/* 的 Bearer 认证）
       AUTOMODE_ADMIN_TOKEN: ${AUTOMODE_ADMIN_TOKEN:?set AUTOMODE_ADMIN_TOKEN in .env}
       # 可选：上游统一 Bearer Key（不填则透传 Agent 的 Authorization）

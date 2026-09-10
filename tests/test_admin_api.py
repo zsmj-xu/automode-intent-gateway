@@ -394,6 +394,135 @@ class AdminApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.status, 200)
             self.assertEqual((await response.json())["data"], [])
 
+    async def test_events_list_detail_and_retry_api(self):
+        store = self.app[TRACE_STORE_KEY]
+        store.create_source(id="src_test_admin", name="Test Ingress", token="tok_test_admin", allow_trusted_identity=True)
+        store.record_event(
+            event_id="evt_admin_test_1",
+            source_id="src_test_admin",
+            call_id="call_admin_1",
+            event_type="request",
+            protocol="openai_chat_completions",
+            capture_stage="model_outbound",
+            content_integrity="complete",
+            is_realtime=True,
+            timestamp="2026-09-09T12:00:00Z",
+            payload_hash="hash_admin_1",
+        )
+
+        async with self.client.get(self.server.make_url("/api/events?source_id=src_test_admin")) as response:
+            self.assertEqual(response.status, 200)
+            data = await response.json()
+            self.assertIn("data", data)
+            self.assertIn("total", data)
+            self.assertEqual(data["total"], 1)
+            self.assertEqual(data["data"][0]["id"], "evt_admin_test_1")
+            self.assertEqual(data["data"][0]["source_id"], "src_test_admin")
+
+        async with self.client.get(self.server.make_url("/api/events/evt_admin_test_1")) as response:
+            self.assertEqual(response.status, 200)
+            detail = await response.json()
+            self.assertEqual(detail["id"], "evt_admin_test_1")
+            self.assertIn("tasks", detail)
+
+        # A failed event without retained encrypted正文 cannot be retried.
+        # The admin API must reject it instead of pretending to enqueue work.
+        store.update_event_status("evt_admin_test_1", processing_status="failed", rule_status="failed", error_message="test_err")
+        async with self.client.post(self.server.make_url("/api/events/evt_admin_test_1/retry")) as response:
+            self.assertEqual(response.status, 409)
+
+        event = store.get_event("evt_admin_test_1")
+        self.assertEqual(event["processing_status"], "failed")
+        self.assertEqual(event["rule_status"], "failed")
+
+    async def test_sources_crud_api(self):
+        async with self.client.get(self.server.make_url("/api/sources")) as response:
+            self.assertEqual(response.status, 200)
+            initial = await response.json()
+            self.assertIn("data", initial)
+
+        # Create
+        new_source = {
+            "name": "Admin Test Source",
+            "token": "tok_admin_crud_1",
+            "allow_trusted_identity": True,
+            "rate_limit_per_minute": 60,
+        }
+        async with self.client.post(self.server.make_url("/api/sources"), json=new_source) as response:
+            self.assertEqual(response.status, 201)
+            created = await response.json()
+            source_id = created["data"]["id"]
+            self.assertEqual(created["data"]["name"], "Admin Test Source")
+            self.assertTrue(created["data"]["allow_trusted_identity"])
+
+        # Update
+        async with self.client.put(self.server.make_url(f"/api/sources/{source_id}"), json={"name": "Updated Source Name", "enabled": False}) as response:
+            self.assertEqual(response.status, 200)
+            updated = await response.json()
+            self.assertEqual(updated["data"]["name"], "Updated Source Name")
+            self.assertFalse(updated["data"]["enabled"])
+
+        # Delete
+        async with self.client.delete(self.server.make_url(f"/api/sources/{source_id}")) as response:
+            self.assertEqual(response.status, 200)
+            deleted = await response.json()
+            self.assertEqual(deleted["status"], "deleted")
+
+    async def test_stats_api(self):
+        async with self.client.get(self.server.make_url("/api/stats")) as response:
+            self.assertEqual(response.status, 200)
+            stats = await response.json()
+            for key in ("rule_queue_depth", "reviewer_queue_depth", "disk_buffer_bytes", "disk_buffer_limit_bytes", "proxy_dropped_count", "reliability_mode"):
+                self.assertIn(key, stats)
+
+    async def test_alerts_channel_source_and_divergence_filters(self):
+        store = self.app[TRACE_STORE_KEY]
+        alert_dual = store.create_event_alert(
+            event_id="evt_flt_1",
+            severity="high",
+            rule_severity="medium",
+            llm_severity="high",
+            llm_status="completed",
+            divergence=True,
+            channel_source="dual",
+            reason_code="DLP_DUAL_HIT",
+            title="HIGH: Dual alert",
+            reason="Both rule and llm hit",
+        )
+        alert_rule = store.create_event_alert(
+            event_id="evt_flt_2",
+            severity="medium",
+            rule_severity="medium",
+            llm_severity="low",
+            llm_status="completed",
+            divergence=False,
+            channel_source="rule",
+            reason_code="DLP_RULE_HIT",
+            title="MEDIUM: Rule only alert",
+            reason="Only rule hit",
+        )
+
+        async with self.client.get(self.server.make_url("/api/alerts?channel_source=dual")) as response:
+            self.assertEqual(response.status, 200)
+            data = await response.json()
+            alert_ids = [a["id"] for a in data["data"]]
+            self.assertIn(alert_dual, alert_ids)
+            self.assertNotIn(alert_rule, alert_ids)
+
+        async with self.client.get(self.server.make_url("/api/alerts?channel_source=rule")) as response:
+            self.assertEqual(response.status, 200)
+            data = await response.json()
+            alert_ids = [a["id"] for a in data["data"]]
+            self.assertIn(alert_rule, alert_ids)
+            self.assertNotIn(alert_dual, alert_ids)
+
+        async with self.client.get(self.server.make_url("/api/alerts?divergence=1")) as response:
+            self.assertEqual(response.status, 200)
+            data = await response.json()
+            alert_ids = [a["id"] for a in data["data"]]
+            self.assertIn(alert_dual, alert_ids)
+            self.assertNotIn(alert_rule, alert_ids)
+
 
 class AdminAuthTests(unittest.IsolatedAsyncioTestCase):
     async def test_non_loopback_binding_requires_and_enforces_token(self):

@@ -142,3 +142,128 @@ test('shows the auth gate on 401 and unlocks after entering the admin token', as
   expect(await screen.findByText('出站请求')).toBeInTheDocument()
   expect(localStorage.getItem('automode.adminToken')).toBe('secret-token')
 })
+
+test('events page lists ingress events and handles retry for failed events', async () => {
+  const eventItem = {
+    event_id: 'evt-123',
+    source_id: 'src-proxy',
+    session_id: 'sess-1',
+    is_historical: false,
+    processing_status: 'failed',
+    association_status: 'request_missing',
+    retry_count: 2,
+    failure_reason: 'LLM reviewer timeout',
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    event_summary: 'POST /v1/messages with 2 tools',
+    tasks: [
+      { task_id: 't-1', stage: 'rule', status: 'completed' },
+      { task_id: 't-2', stage: 'reviewer', status: 'failed', failure_reason: 'LLM reviewer timeout' },
+    ],
+    alerts: [],
+  }
+  const sourceItem = {
+    id: 'src-proxy',
+    name: 'Proxy Gateway',
+    token: 'tok-123',
+    enabled: true,
+    allow_trusted_identity: true,
+    rate_limit_per_minute: 60,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  }
+
+  const fetchMock = vi.fn(async (input: string | URL | Request) => {
+    const path = String(input)
+    if (path === '/api/dashboard') return jsonOk(dashboardPayload)
+    if (path.startsWith('/api/events/evt-123/retry')) return jsonOk({ event_id: 'evt-123', status: 'pending' })
+    if (path.startsWith('/api/events/evt-123')) return jsonOk(eventItem)
+    if (path.startsWith('/api/events?')) return jsonOk({ data: [eventItem], total: 1 })
+    if (path === '/api/sources') return jsonOk({ data: [sourceItem] })
+    if (path === '/api/events') return sseStub()
+    return jsonOk({ data: [] })
+  })
+  vi.stubGlobal('fetch', fetchMock)
+
+  render(<App />)
+  fireEvent.click(screen.getByRole('button', { name: '事件' }))
+  expect(await screen.findByText('标准事件中心')).toBeInTheDocument()
+  expect(await screen.findByText(/evt-123/)).toBeInTheDocument()
+  expect(screen.getByText(/缺失对应请求/)).toBeInTheDocument()
+  expect(screen.getByText('failed')).toBeInTheDocument()
+
+  // Click retry
+  const retryBtn = screen.getByTitle('重试此事件')
+  fireEvent.click(retryBtn)
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/events/evt-123/retry', expect.objectContaining({ method: 'POST' })))
+
+  // Switch to sources tab
+  fireEvent.click(screen.getByRole('button', { name: /来源与授权/ }))
+  expect(await screen.findByText('Proxy Gateway')).toBeInTheDocument()
+  expect(screen.getByText('src-proxy')).toBeInTheDocument()
+})
+
+test('alerts page supports dual channel filter and displays dual badge and divergence', async () => {
+  const dualAlert = {
+    id: 'a-dual',
+    trace_id: 't1',
+    created_at: '',
+    severity: 'high',
+    status: 'open',
+    channel_source: 'dual',
+    divergence: true,
+    review_status: 'needs_review',
+    title: 'HIGH: Data Exfiltration',
+    reason: '规则检测到私钥，LLM判定为安全操作',
+    matched_rules: [{ name: 'RSA Private Key' }],
+    data_findings: [{ category: 'credential' }],
+    llm_analysis: { risk: 'low', reasoning: 'Mock analysis' },
+    evidence: ['BEGIN RSA PRIVATE KEY'],
+    actions: [],
+    final_stage: 'rules',
+  }
+
+  const fetchMock = vi.fn(async (input: string | URL | Request) => {
+    const path = String(input)
+    if (path === '/api/dashboard') return jsonOk(dashboardPayload)
+    if (path.startsWith('/api/alerts')) return jsonOk({ data: [dualAlert] })
+    if (path === '/api/events') return sseStub()
+    return jsonOk({ data: [] })
+  })
+  vi.stubGlobal('fetch', fetchMock)
+
+  render(<App />)
+  fireEvent.click(screen.getByRole('button', { name: '告警' }))
+  expect(await screen.findByText('告警中心')).toBeInTheDocument()
+  expect(screen.getAllByText(/Dual/).length).toBeGreaterThan(0)
+  expect(screen.getAllByText(/结论分歧/).length).toBeGreaterThan(0)
+
+  // Click filter for dual
+  fireEvent.click(screen.getByRole('button', { name: /双命中 \[Dual\]/ }))
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('channel_source=dual'), expect.anything()))
+})
+
+test('failed review remains visibly unresolved and can be filtered independently of rule hits', async () => {
+  const failedAlert = {
+    id: 'a-failed', trace_id: 't1', created_at: '', severity: 'critical', status: 'open',
+    title: 'Synthetic credential alert', reason_code: 'CREDENTIAL', reason: 'Synthetic rule hit',
+    rule_severity: 'critical', llm_severity: null, llm_status: 'failed', review_status: 'failed',
+    channel_source: 'rule', evidence: [], actions: [], final_stage: 'rules',
+  }
+  const fetchMock = vi.fn(async (input: string | URL | Request) => {
+    const path = String(input)
+    if (path === '/api/dashboard') return jsonOk(dashboardPayload)
+    if (path.startsWith('/api/alerts')) return jsonOk({ data: [failedAlert] })
+    if (path === '/api/events') return sseStub()
+    return jsonOk({ data: [] })
+  })
+  vi.stubGlobal('fetch', fetchMock)
+  render(<App />)
+  fireEvent.click(screen.getByRole('button', { name: '告警' }))
+  expect(await screen.findByText('分析失败，不能判断为无风险')).toBeInTheDocument()
+  expect(screen.queryByText('LLM 未告警')).not.toBeInTheDocument()
+  fireEvent.click(screen.getByRole('button', { name: '分析失败' }))
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('review_status=failed'), expect.anything()))
+  fireEvent.click(screen.getByRole('button', { name: '规则命中（含双命中）' }))
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('hit_source=rule_hit'), expect.anything()))
+})

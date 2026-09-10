@@ -36,6 +36,7 @@ export async function api<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     ...options,
     headers: {
+      'accept': 'application/json',
       'content-type': 'application/json',
       ...(token ? { 'x-automode-admin-token': token } : {}),
       ...(options?.headers || {}),
@@ -58,4 +59,54 @@ export const post = <T>(path: string, body: unknown) =>
 export const patch = <T>(path: string, body: unknown) =>
   api<T>(path, { method: 'PATCH', body: JSON.stringify(body) })
 
+export const put = <T>(path: string, body: unknown) =>
+  api<T>(path, { method: 'PUT', body: JSON.stringify(body) })
+
 export const del = <T>(path: string) => api<T>(path, { method: 'DELETE' })
+
+export async function fetchEvents(params: {
+  limit?: number
+  offset?: number
+  source_id?: string
+  is_historical?: boolean
+  processing_status?: string
+  association_status?: string
+} = {}) {
+  const query = new URLSearchParams()
+  if (params.limit !== undefined) query.set('limit', String(params.limit))
+  if (params.offset !== undefined) query.set('offset', String(params.offset))
+  if (params.source_id) query.set('source_id', params.source_id)
+  if (params.is_historical !== undefined) query.set('is_historical', params.is_historical ? '1' : '0')
+  if (params.processing_status) query.set('processing_status', params.processing_status)
+  if (params.association_status) query.set('association_status', params.association_status)
+  const q = query.toString()
+  return api<{ data: import('./types').EventItem[]; total: number }>(`/api/events${q ? `?${q}` : ''}`)
+}
+
+export async function fetchEventDetail(eventId: string) {
+  return api<import('./types').EventItem>(`/api/events/${encodeURIComponent(eventId)}`)
+}
+
+export async function retryEvent(eventId: string) {
+  return post<{ status: string; event_id: string }>(`/api/events/${encodeURIComponent(eventId)}/retry`, {})
+}
+
+export async function fetchSources() {
+  return api<{ data: import('./types').SourceItem[] }>('/api/sources')
+}
+
+export async function createSource(source: Partial<import('./types').SourceItem>) {
+  return post<{ data: import('./types').SourceItem }>('/api/sources', source)
+}
+
+export async function updateSource(sourceId: string, source: Partial<import('./types').SourceItem>) {
+  return put<{ data: import('./types').SourceItem }>(`/api/sources/${encodeURIComponent(sourceId)}`, source)
+}
+
+export async function deleteSource(sourceId: string) {
+  return del<{ status: string }>(`/api/sources/${encodeURIComponent(sourceId)}`)
+}
+
+export async function fetchSystemStats() {
+  return api<import('./types').SystemStats>('/api/stats')
+}
